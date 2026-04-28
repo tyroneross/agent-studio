@@ -13,6 +13,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+// Pass 8: per-project flag tracking whether the test panel has seen a
+// completed run. While unset, we surface an example query above the textarea
+// so first-time users have something concrete to try.
+function firstRunSeenKey(projectId) {
+  return `agent-studio:firstRunSeen:${projectId}`;
+}
+
 const STATUS_LABEL = {
   idle: "idle",
   running: "running",
@@ -38,7 +45,29 @@ export default function TestPanel({ project, isOpen, onToggle }) {
   const [brief, setBrief] = useState("");
   const [runDir, setRunDir] = useState(null);
   const [error, setError] = useState(null);
+  // Pass 8: first-run-seen flag, hydrated from localStorage on project change.
+  // Determines whether to show the example-query hint above the textarea.
+  const [firstRunSeen, setFirstRunSeen] = useState(true);
   const abortRef = useRef(null);
+
+  // Hydrate first-run flag whenever the active project changes. Default to
+  // "seen" for SSR to avoid hint flicker before localStorage is available.
+  useEffect(() => {
+    if (!project?.id) {
+      setFirstRunSeen(true);
+      return;
+    }
+    try {
+      if (typeof window === "undefined") {
+        setFirstRunSeen(true);
+        return;
+      }
+      const seen = window.localStorage.getItem(firstRunSeenKey(project.id)) === "1";
+      setFirstRunSeen(seen);
+    } catch {
+      setFirstRunSeen(true);
+    }
+  }, [project?.id]);
 
   // Fetch model list once on mount and again every time the panel opens.
   // Keep this side-effect-free of project state so model availability stays
@@ -139,9 +168,22 @@ export default function TestPanel({ project, isOpen, onToggle }) {
     if (evt.type === "complete") {
       setBrief(evt.brief || "");
       setRunDir(evt.runDir || null);
+      // Pass 8: persist first-run-seen as soon as the run completes. We hold
+      // the project id at call time via `project?.id`. If the user navigates
+      // mid-run we still record against the project that owned the run.
+      if (project?.id) {
+        try {
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem(firstRunSeenKey(project.id), "1");
+          }
+        } catch {
+          // ignore
+        }
+        setFirstRunSeen(true);
+      }
       return;
     }
-  }, []);
+  }, [project?.id]);
 
   // Parse SSE text stream incrementally. We buffer between reads and split on
   // blank lines (the SSE event terminator). Each event payload is a single
@@ -224,6 +266,11 @@ export default function TestPanel({ project, isOpen, onToggle }) {
 
       {isOpen && (
         <div className="test-panel-body">
+          {!firstRunSeen && (
+            <p className="tp-first-run-hint" data-test-panel-first-run-hint>
+              Try: &ldquo;What&rsquo;s the riskiest dependency in this graph?&rdquo;
+            </p>
+          )}
           <div className="test-panel-controls">
             <label className="tp-field">
               <span className="tp-label">Model</span>
@@ -374,6 +421,15 @@ export default function TestPanel({ project, isOpen, onToggle }) {
           display: flex;
           flex-direction: column;
           gap: 10px;
+        }
+        .tp-first-run-hint {
+          margin: 0;
+          padding: 6px 10px;
+          font-size: 12px;
+          color: var(--muted);
+          background: var(--accent-soft);
+          border: 1px solid var(--border);
+          border-radius: 8px;
         }
         .test-panel-controls {
           display: flex;

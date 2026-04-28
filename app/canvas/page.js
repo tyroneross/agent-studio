@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ProjectSwitcher from "../components/ProjectSwitcher";
 import TestPanel from "../components/TestPanel";
+import WelcomeModal from "../components/WelcomeModal";
 import WorkingFolderInput from "../components/WorkingFolderInput";
 import {
   SEED_NODES,
@@ -39,6 +40,11 @@ const ZOOM_MAX = 2.5;
 
 const PERSIST_DEBOUNCE_MS = 350;
 
+// Pass 8: localStorage flag for the welcome modal. Once set, the modal does
+// not auto-show. The toolbar `?` button can still re-open it on demand.
+// (The first-run-seen-per-project flag lives inside TestPanel.)
+const WELCOME_FLAG_KEY = "agent-studio:onboarded:v1";
+
 export default function StudioCanvas() {
   const router = useRouter();
   // Canvas page is always rendered against an existing project, but we have to
@@ -57,6 +63,10 @@ export default function StudioCanvas() {
   const [hoveredNodeId, setHoveredNodeId] = useState(null);
   const [connect, setConnect] = useState(null);
   const [testPanelOpen, setTestPanelOpen] = useState(false);
+  // Pass 8: welcome modal. Defaults to closed; the hydration effect opens it
+  // once when the localStorage flag is missing. The `?` button in the toolbar
+  // re-opens it without writing the flag.
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
 
   const containerRef = useRef(null);
   const dragState = useRef(null);
@@ -339,6 +349,12 @@ export default function StudioCanvas() {
     setPan(active.canvas.pan);
     setZoom(active.canvas.zoom);
     hasHydratedRef.current = true;
+    // Pass 8: open the welcome modal on first canvas visit. Single global
+    // flag so the modal appears once per browser, regardless of how the
+    // user got to /canvas (demo CTA, blank project, or directly).
+    try {
+      if (typeof window !== "undefined" && !window.localStorage.getItem(WELCOME_FLAG_KEY)) setWelcomeOpen(true);
+    } catch {}
     return () => {
       if (persistTimerRef.current) {
         clearTimeout(persistTimerRef.current);
@@ -579,6 +595,16 @@ export default function StudioCanvas() {
     setSelectedId(null);
   }
 
+  // Pass 8: welcome modal helpers. dismiss persists the flag; reopen does
+  // not write the flag, so the "shown once auto" contract is preserved.
+  function dismissWelcome() {
+    setWelcomeOpen(false);
+    try {
+      if (typeof window !== "undefined") window.localStorage.setItem(WELCOME_FLAG_KEY, "1");
+    } catch {}
+  }
+  function reopenWelcome() { setWelcomeOpen(true); }
+
   const edgePaths = useMemo(() => {
     const byId = Object.fromEntries(nodes.map((n) => [n.id, n]));
     return edges
@@ -696,6 +722,26 @@ export default function StudioCanvas() {
           >
             clear
           </button>
+          <span className="tool-sep" />
+          <button
+            className="tool-btn tool-help"
+            onClick={reopenWelcome}
+            title="Show the welcome hints"
+            aria-label="Show welcome hints"
+            data-canvas-help-button
+          >
+            ?
+          </button>
+          <a
+            className="tool-btn tool-readme"
+            href="/README.md"
+            target="_blank"
+            rel="noreferrer"
+            title="Open README in a new tab"
+            data-canvas-readme-link
+          >
+            README
+          </a>
         </div>
       </header>
 
@@ -836,6 +882,12 @@ export default function StudioCanvas() {
           })}
         </div>
 
+        {nodes.length === 0 && (
+          <div className="studio-empty" data-canvas-empty>
+            + Add a node from the toolbar, or run the demo project for a starter graph.
+          </div>
+        )}
+
         <div className="studio-help">
           drag empty space to pan · scroll to zoom · click a node to expand · drag a node to move ·
           drag from the right port to connect · click an edge then Delete to remove
@@ -944,6 +996,8 @@ export default function StudioCanvas() {
         </aside>
       )}
       </div>
+
+      <WelcomeModal open={welcomeOpen} onDismiss={dismissWelcome} />
 
       <style jsx>{`
         .studio-shell {
@@ -1143,6 +1197,33 @@ export default function StudioCanvas() {
           background: rgba(255, 255, 255, 0.7);
           padding: 4px 10px;
           border-radius: 6px;
+        }
+        .studio-empty {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 14px;
+          color: var(--faint);
+          pointer-events: none;
+          padding: 24px;
+          text-align: center;
+        }
+        .tool-help {
+          width: 32px;
+          padding: 0;
+          font-weight: 600;
+        }
+        .tool-readme {
+          text-decoration: none;
+          color: var(--ink);
+          display: inline-flex;
+          align-items: center;
+        }
+        .tool-readme:hover {
+          border-color: var(--accent);
+          color: var(--accent-strong);
         }
         .studio-panel {
           width: 340px;

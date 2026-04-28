@@ -1,12 +1,16 @@
 // POST /api/fs/validate
-// Body: { path: string }
+// Body: { path: string, create?: boolean }
 // Response (always JSON):
-//   - On permitted path: { ok: true, exists, isDirectory, writable, error? }
+//   - On permitted path: { ok: true, exists, isDirectory, writable, created?, error? }
 //   - On rejected path:  { ok: false, error: string }
 //
 // "Permitted" means the path lives under one of /Users/, /tmp/, /var/folders/.
 // This is a defense in depth check for a local single-user dev tool: it stops
 // us from accidentally probing /etc/, /System/, /private/etc, etc.
+//
+// Pass 8: when `create: true` and the directory does not exist (and the path
+// is permitted), the route runs `mkdir -p` and reports `{ created: true }`.
+// Existing callers that omit `create` get the original behavior unchanged.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -60,6 +64,8 @@ export async function POST(request) {
     return Response.json({ ok: false, error: "path outside permitted root" }, { status: 400 });
   }
 
+  const create = body?.create === true;
+
   try {
     const stat = await fs.stat(absolute);
     const isDirectory = stat.isDirectory();
@@ -67,6 +73,32 @@ export async function POST(request) {
     return Response.json({ ok: true, exists: true, isDirectory, writable });
   } catch (err) {
     if (err && err.code === "ENOENT") {
+      // Pass 8: optional create. We already validated the prefix above, so
+      // mkdir -p is bounded to the permitted roots.
+      if (create) {
+        try {
+          await fs.mkdir(absolute, { recursive: true });
+          const writable = await isWritable(absolute);
+          return Response.json({
+            ok: true,
+            exists: true,
+            isDirectory: true,
+            writable,
+            created: true,
+          });
+        } catch (mkErr) {
+          return Response.json(
+            {
+              ok: true,
+              exists: false,
+              isDirectory: false,
+              writable: false,
+              error: mkErr?.message || "mkdir failed",
+            },
+            { status: 200 },
+          );
+        }
+      }
       return Response.json({ ok: true, exists: false, isDirectory: false, writable: false });
     }
     return Response.json(

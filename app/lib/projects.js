@@ -396,3 +396,37 @@ export const PERMITTED_PATH_PREFIXES = ["/Users/", "/tmp/", "/var/folders/"];
 export function looksAbsolutePath(value) {
   return typeof value === "string" && value.startsWith("/");
 }
+
+// Pass 8: demo-project flow. The landing page surfaces a "Try the demo
+// project" CTA which creates this canonical project (or opens it if it
+// already exists) and routes to /canvas.
+export const DEMO_PROJECT_NAME = "Demo: Solo Tool Agent";
+export const DEMO_PROJECT_WORKING_FOLDER = "/tmp/agent-studio-demo";
+
+export const DEMO_PROJECT_GOAL =
+  "Plan a 1-week rollout for a small internal tool";
+export const DEMO_PROJECT_CONTEXT =
+  "Audience: a 12-person ops team familiar with the current spreadsheet workflow.\nConstraints: no security review needed, can ship behind an internal flag, two engineers half-time.\nSuccess looks like: by Friday EOD, ops can run the new tool end-to-end on real data.";
+export const DEMO_PROJECT_OUTCOME =
+  "A timeline, an action list, and risks";
+
+// Find an existing demo project by exact name match. Returns null when no
+// store exists or no project carries the demo name. The match is by name
+// (not id) because demo projects are created locally and aren't shared.
+export function findDemoProject(store) {
+  if (!store || !Array.isArray(store.projects)) return null;
+  return store.projects.find((p) => p.name === DEMO_PROJECT_NAME) ?? null;
+}
+
+// Build a demo project with the seed graph pre-loaded. Caller decides where
+// it goes (store append) and is responsible for `mkdir -p` of the working
+// folder via /api/fs/validate { create: true } before navigation.
+export function makeDemoProject() {
+  return makeProject({
+    name: DEMO_PROJECT_NAME,
+    workingFolder: DEMO_PROJECT_WORKING_FOLDER,
+    goal: DEMO_PROJECT_GOAL,
+    context: DEMO_PROJECT_CONTEXT,
+    outcome: DEMO_PROJECT_OUTCOME,
+  });
+}
