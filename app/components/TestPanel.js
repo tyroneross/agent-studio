@@ -49,6 +49,13 @@ export default function TestPanel({ project, isOpen, onToggle }) {
   // Determines whether to show the example-query hint above the textarea.
   const [firstRunSeen, setFirstRunSeen] = useState(true);
   const abortRef = useRef(null);
+  // Pass 11: track whether THIS project has been auto-opened already in this
+  // mount. Without this, every isOpen flip would re-trigger the auto-open
+  // effect and we'd fight the user's explicit close.
+  const autoOpenedForProjectRef = useRef(null);
+  // Pass 11: track whether the current open run has been pre-filled. We seed
+  // the query exactly once per first-run open so user edits aren't clobbered.
+  const prefilledForProjectRef = useRef(null);
 
   // Hydrate first-run flag whenever the active project changes. Default to
   // "seen" for SSR to avoid hint flicker before localStorage is available.
@@ -64,10 +71,46 @@ export default function TestPanel({ project, isOpen, onToggle }) {
       }
       const seen = window.localStorage.getItem(firstRunSeenKey(project.id)) === "1";
       setFirstRunSeen(seen);
+      // Reset per-project gates so a project switch can re-trigger auto-open
+      // and pre-fill (subject to firstRunSeen still being false).
+      autoOpenedForProjectRef.current = null;
+      prefilledForProjectRef.current = null;
     } catch {
       setFirstRunSeen(true);
     }
   }, [project?.id]);
+
+  // Pass 11: auto-open the panel on the very first visit to a project the
+  // user hasn't run yet. Surfacing the panel collapsed-by-default left
+  // first-time users staring at a graph with no obvious action; opening it
+  // shows the model picker, the example-query hint, and the Run button at
+  // once. We only do this once per project per mount: any explicit close
+  // sets firstRunSeen, which short-circuits this effect on next render.
+  useEffect(() => {
+    if (!project?.id) return;
+    if (firstRunSeen) return;
+    if (isOpen) return;
+    if (autoOpenedForProjectRef.current === project.id) return;
+    autoOpenedForProjectRef.current = project.id;
+    onToggle?.();
+  }, [project?.id, firstRunSeen, isOpen, onToggle]);
+
+  // Pass 11: pre-fill the textarea with a sensible example the first time
+  // this project's panel opens. Use the project goal when present, otherwise
+  // fall back to a graph-flavoured starter. We only seed if the textarea is
+  // empty; we never overwrite a user edit.
+  useEffect(() => {
+    if (!project?.id) return;
+    if (!isOpen) return;
+    if (firstRunSeen) return;
+    if (prefilledForProjectRef.current === project.id) return;
+    prefilledForProjectRef.current = project.id;
+    setQuery((current) => {
+      if (current && current.trim().length > 0) return current;
+      const goal = typeof project.goal === "string" ? project.goal.trim() : "";
+      return goal || "What is the riskiest dependency in this graph?";
+    });
+  }, [project?.id, project?.goal, isOpen, firstRunSeen]);
 
   // Fetch model list once on mount and again every time the panel opens.
   // Keep this side-effect-free of project state so model availability stays
@@ -215,9 +258,37 @@ export default function TestPanel({ project, isOpen, onToggle }) {
     }
   }
 
+  // Pass 11: persist firstRunSeen the moment the user commits to running. We
+  // also already persist on `complete` (Pass 8 behavior); doing both means a
+  // run that fails halfway still counts as "user has tried this project" and
+  // suppresses the auto-open the next time they navigate back.
+  function markFirstRunSeen() {
+    if (!project?.id) return;
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(firstRunSeenKey(project.id), "1");
+      }
+    } catch {
+      /* ignore */
+    }
+    setFirstRunSeen(true);
+  }
+
+  // Pass 11: wrap the toggle so an explicit user-driven close marks the
+  // first-run flag. We never set the flag on open (the auto-open effect
+  // does that path); only on close, which is the user opting out.
+  function handleToggleClick() {
+    if (isOpen) {
+      // User is closing the panel — record intent.
+      markFirstRunSeen();
+    }
+    onToggle?.();
+  }
+
   async function startRun() {
     if (!project) return;
     if (running) return;
+    markFirstRunSeen();
     resetRunState();
     setRunning(true);
     const ac = new AbortController();
@@ -257,7 +328,7 @@ export default function TestPanel({ project, isOpen, onToggle }) {
       <button
         type="button"
         className="test-panel-handle"
-        onClick={onToggle}
+        onClick={handleToggleClick}
         data-test-panel-toggle
         aria-expanded={isOpen}
       >

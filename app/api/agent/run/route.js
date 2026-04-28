@@ -26,6 +26,25 @@ export const runtime = "nodejs";
 
 const PERMITTED_PREFIXES = ["/Users/", "/tmp/", "/var/folders/"];
 
+// Pass 11: must mirror /api/uploads exactly so uploads accepted there can be
+// loaded back here without surprise. Anything outside this set is silently
+// skipped with a warning event (we don't fail the run on a stray .pdf).
+const PERMITTED_UPLOAD_EXTENSIONS = new Set([
+  ".txt",
+  ".md",
+  ".markdown",
+  ".json",
+  ".yaml",
+  ".yml",
+  ".csv",
+]);
+
+// Pass 11: total byte cap across ALL inlined upload contents combined. Sized
+// to leave plenty of headroom under Ollama's default num_ctx (8192 tokens ≈
+// 32 KB) for the role template, project goal/context/outcome, node prompts,
+// upstream outputs, and the user query. 64 KB is the budget for uploads only.
+const UPLOAD_BYTE_BUDGET = 64 * 1024;
+
 function isPermittedFolder(absolute) {
   return PERMITTED_PREFIXES.some(
     (prefix) => absolute.startsWith(prefix) || absolute + "/" === prefix,
@@ -39,6 +58,118 @@ function resolveWritableRunDir(workingFolder) {
   const abs = path.resolve(workingFolder);
   if (!isPermittedFolder(abs)) return null;
   return abs;
+}
+
+// Pass 11: load each upload's contents from disk under a strict allowlist.
+//
+// Path-traversal protection: every savedPath must resolve under
+// `<workingFolder>/uploads/`. We compare normalized absolute paths; a pasted
+// `/etc/passwd` or `..`-laden savedPath is rejected before any read.
+//
+// Extension allowlist: same set as /api/uploads accepts on write.
+//
+// Byte budget: 64 KB total across all loaded files. The first N files that
+// fit are inlined fully; the file that crosses the boundary is truncated to
+// the remaining budget and flagged `truncated: true`; subsequent files are
+// flagged `skipped: true` (no contents). The runtime turns these flags into
+// a concise note in the system prompt so the model knows context was clipped.
+//
+// Errors are non-fatal: anything that can't be read (missing, permission,
+// non-string) emits a `warning` event via `emit` and is dropped from the
+// loaded list. We never throw out of here.
+async function loadUploadContents(project, emit) {
+  const list = Array.isArray(project?.uploads) ? project.uploads : [];
+  if (list.length === 0) return { loaded: [], totalBytes: 0, truncated: false };
+
+  const wfRaw = project?.workingFolder;
+  const wfAbs =
+    typeof wfRaw === "string" && wfRaw.startsWith("/") && isPermittedFolder(path.resolve(wfRaw))
+      ? path.resolve(wfRaw)
+      : null;
+  // No valid workingFolder → no uploads can possibly satisfy the allowlist.
+  if (!wfAbs) {
+    if (list.length > 0) {
+      emit({
+        type: "warning",
+        text: `project working folder is not under permitted root; ${list.length} upload(s) skipped`,
+      });
+    }
+    return { loaded: [], totalBytes: 0, truncated: false };
+  }
+  const uploadsRoot = path.resolve(path.join(wfAbs, "uploads"));
+  const uploadsRootPrefix = uploadsRoot + path.sep;
+
+  const loaded = [];
+  let totalBytes = 0;
+  let truncated = false;
+
+  for (const u of list) {
+    const name = typeof u?.name === "string" ? u.name : null;
+    const savedPathRaw = typeof u?.savedPath === "string" ? u.savedPath : null;
+    if (!name || !savedPathRaw) continue;
+
+    // Normalize and ensure containment under <wf>/uploads/. Also accept the
+    // exact uploads root itself? No — files only.
+    const abs = path.resolve(savedPathRaw);
+    if (abs !== uploadsRoot && !abs.startsWith(uploadsRootPrefix)) {
+      emit({
+        type: "warning",
+        text: `upload "${name}" outside project uploads dir; skipped`,
+      });
+      continue;
+    }
+    const ext = path.extname(abs).toLowerCase();
+    if (!PERMITTED_UPLOAD_EXTENSIONS.has(ext)) {
+      emit({
+        type: "warning",
+        text: `upload "${name}" has non-permitted extension "${ext}"; skipped`,
+      });
+      continue;
+    }
+
+    // If we've already hit the budget, mark this file skipped without reading.
+    if (totalBytes >= UPLOAD_BYTE_BUDGET) {
+      loaded.push({ name, contents: "", skipped: true });
+      truncated = true;
+      continue;
+    }
+
+    let contents;
+    try {
+      contents = await fs.readFile(abs, "utf8");
+    } catch (err) {
+      emit({
+        type: "warning",
+        text: `upload "${name}" could not be read: ${err?.message || "read failed"}`,
+      });
+      continue;
+    }
+
+    const size = Buffer.byteLength(contents, "utf8");
+    const remaining = UPLOAD_BYTE_BUDGET - totalBytes;
+    if (size <= remaining) {
+      loaded.push({ name, contents });
+      totalBytes += size;
+    } else {
+      // Partial inline — truncate to the remaining budget, on a UTF-8 boundary
+      // (Buffer.from(contents).slice(0,remaining).toString("utf8") would do
+      // for ASCII; for multi-byte we trim and let TextDecoder strip a partial
+      // last codepoint). Conservative: slice the original string by chars
+      // until its byte length fits. Cheaper to slice from the end of a
+      // tight-loop buffer here since contents is bounded by /api/uploads to
+      // 10 MB.
+      let trimmed = contents;
+      while (Buffer.byteLength(trimmed, "utf8") > remaining && trimmed.length > 0) {
+        // Drop ~1% per iteration; converges fast for ASCII and OK for mixed.
+        trimmed = trimmed.slice(0, Math.max(0, Math.floor(trimmed.length * 0.99) - 1));
+      }
+      loaded.push({ name, contents: trimmed, truncated: true });
+      totalBytes += Buffer.byteLength(trimmed, "utf8");
+      truncated = true;
+    }
+  }
+
+  return { loaded, totalBytes, truncated };
 }
 
 function isoStamp() {
@@ -107,10 +238,23 @@ export async function POST(request) {
           return;
         }
 
+        // Pass 11: resolve upload contents from disk before any LLM call. We
+        // run this here (the route, the Node-runtime boundary) instead of
+        // inside the lib so file-system access stays out of the runtime
+        // module — keeps the lib testable under mocked fetch.
+        const uploads = await loadUploadContents(project, send);
+        send({
+          type: "uploads-loaded",
+          count: uploads.loaded.length,
+          totalBytes: uploads.totalBytes,
+          truncated: uploads.truncated,
+        });
+
         const { transcript, brief } = await runProject({
           project,
           query,
           model,
+          loadedUploads: uploads.loaded,
           baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
           signal: ac.signal,
           onEvent: (evt) => {

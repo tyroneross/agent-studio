@@ -167,14 +167,32 @@ export function planExecution(project) {
 
 // ── Prompt composition ─────────────────────────────────────────────────────
 
-function projectContextBlock(project) {
+// Pass 11: build the project-level context block. When `loadedUploads` is
+// supplied (route resolved each upload's contents and policed the byte budget),
+// inline each file's contents under a labeled section. Files past the budget
+// arrive with truncated/skipped flags; we surface those as a single trailing
+// note rather than silently dropping them. The route owns disk reads and the
+// path allowlist; this function never touches the filesystem.
+function projectContextBlock(project, loadedUploads) {
   const lines = [];
   if (project.goal) lines.push(`Project goal: ${project.goal}`);
   if (project.outcome) lines.push(`Desired outcome: ${project.outcome}`);
   if (project.context) lines.push(`Project context: ${project.context}`);
-  if (Array.isArray(project.uploads) && project.uploads.length > 0) {
-    const names = project.uploads.map((u) => u.name).join(", ");
-    lines.push(`Project uploads available (filenames only, contents not loaded): ${names}`);
+
+  const loaded = Array.isArray(loadedUploads) ? loadedUploads : [];
+  const inlined = loaded.filter((u) => typeof u?.contents === "string" && u.contents.length > 0);
+  for (const u of inlined) {
+    lines.push("");
+    lines.push(`### Uploaded context: ${u.name}`);
+    lines.push(u.contents);
+    if (u.truncated) {
+      lines.push(`(${u.name} truncated to fit context budget)`);
+    }
+  }
+  const skippedCount = loaded.filter((u) => u && u.skipped === true).length;
+  if (skippedCount > 0) {
+    lines.push("");
+    lines.push(`(${skippedCount} more file${skippedCount === 1 ? "" : "s"} truncated due to context budget)`);
   }
   return lines.join("\n");
 }
@@ -196,14 +214,14 @@ function upstreamOutputsBlock(node, incoming, results) {
   return sections.join("\n\n");
 }
 
-function buildMessages(node, project, query, incoming, results) {
+function buildMessages(node, project, query, incoming, results, loadedUploads) {
   // Pass 7: prefer the per-project role-prompt override when present, else
   // fall back to the hardcoded default for the role.
   const roleTemplate = getEffectiveRoleTemplate(node.role, project?.rolePromptOverrides);
   const sysParts = [HARD_RULES, "", roleTemplate];
   const userParts = [];
 
-  const ctx = projectContextBlock(project);
+  const ctx = projectContextBlock(project, loadedUploads);
   if (ctx) userParts.push(ctx);
 
   if (typeof node.instructions === "string" && node.instructions.trim()) {
@@ -336,6 +354,12 @@ export async function runProject({
   onEvent = () => {},
   signal,
   baseUrl = DEFAULT_BASE_URL,
+  // Pass 11: pre-resolved upload contents from the route. Shape:
+  //   [{ name, contents, truncated?, skipped? }]
+  // The route is the Node-runtime boundary that owns disk access + the path
+  // allowlist; this lib stays filesystem-free so it remains testable under a
+  // mocked fetch and portable to other deploy targets.
+  loadedUploads,
 }) {
   if (!project || !project.canvas) {
     throw new Error("project with canvas required");
@@ -399,7 +423,7 @@ export async function runProject({
           onEvent({ type: "node-start", id, name: node.title, role: node.role });
           const t0 = Date.now();
           try {
-            const messages = buildMessages(node, project, query, plan.incoming, results);
+            const messages = buildMessages(node, project, query, plan.incoming, results, loadedUploads);
             const { text, parsed, bytes } = await streamChat(
               baseUrl,
               resolvedModel,

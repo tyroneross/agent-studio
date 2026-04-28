@@ -127,6 +127,12 @@ export default function NewProjectForm({ onCreate, onCancel, seedPattern }) {
   // Internal: run the same validate-and-set pattern used by both manual edits
   // and the default-folder pre-fill. Kept separate so the pre-fill effect
   // doesn't have to flip folderTouchedRef.
+  //
+  // Pass 11: send `create: true` so a typed-but-not-yet-existing path is
+  // mkdir'd in lockstep with the inner WorkingFolderInput's own validator.
+  // Without this, the form's parallel validator could race and report
+  // exists:false while the inner validator created the dir, leaving the
+  // submit button stuck in "validating working folder…".
   function kickValidate(value) {
     setFolderValidated(false);
     if (!value) return;
@@ -138,7 +144,7 @@ export default function NewProjectForm({ onCreate, onCancel, seedPattern }) {
         const res = await fetch("/api/fs/validate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: captured }),
+          body: JSON.stringify({ path: captured, create: true }),
         });
         const data = await res.json();
         if (data && data.ok && data.exists && data.isDirectory && data.writable) {

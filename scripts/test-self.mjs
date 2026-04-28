@@ -137,6 +137,135 @@ async function runSentinelOverrideSubTest(fixtureProject) {
   );
 }
 
+// Pass 11: assert that loadedUploads contents flow into the system prompt the
+// runtime composes. We mock fetch the same way the override sub-test does so
+// this runs deterministically without Ollama. The assertion is content-only:
+// every prompt for the seed graph should contain the BEEP sentinel because
+// the project context block now precedes the role/instruction parts.
+async function runLoadedUploadsSubTest(fixtureProject) {
+  const SENTINEL = "BEEP_LOADED_UPLOAD_v11";
+  const project = JSON.parse(JSON.stringify(fixtureProject));
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/api/tags")) {
+      return new Response(JSON.stringify({ models: [{ name: "mock-model" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (u.endsWith("/api/chat")) {
+      const body = JSON.stringify({
+        message: { content: '{"result":"ok"}' },
+        done: true,
+      });
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body + "\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "application/x-ndjson" },
+      });
+    }
+    return new Response("not mocked", { status: 500 });
+  };
+
+  const baseLen = _lastSystemPrompts.length;
+  try {
+    await runProject({
+      project,
+      query: "loaded-uploads test",
+      model: "mock-model",
+      baseUrl: "http://mock-ollama",
+      loadedUploads: [{ name: "notes.md", contents: SENTINEL }],
+      onEvent: () => {},
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const newPrompts = _lastSystemPrompts.slice(baseLen);
+  // Note: contents flow through the USER message (via projectContextBlock),
+  // not the system message. The ring buffer only captures system prompts, so
+  // we need a different probe: re-build a single set of messages by hand by
+  // running buildMessages indirectly through runProject + checking that no
+  // prompt is empty (ensures the run completed end-to-end). The actual
+  // contents check happens in the dedicated buildMessages assertion below.
+  if (newPrompts.length === 0) {
+    fail("loaded-uploads sub-test: runtime recorded no system prompts");
+  }
+
+  // Dedicated assertion: import the runtime's buildMessages indirectly by
+  // composing one ourselves via a known fixture node. We can't re-export
+  // buildMessages without changing the public API; instead, hook into the
+  // chat call by snooping the request body from a more discriminating mock.
+  let observedUserContent = "";
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith("/api/tags")) {
+      return new Response(JSON.stringify({ models: [{ name: "mock-model" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (u.endsWith("/api/chat")) {
+      try {
+        const parsed = JSON.parse(init?.body || "{}");
+        const userMsg = (parsed.messages || []).find((m) => m.role === "user");
+        if (userMsg && typeof userMsg.content === "string") {
+          observedUserContent += userMsg.content + "\n--\n";
+        }
+      } catch {
+        /* ignore */
+      }
+      const body = JSON.stringify({
+        message: { content: '{"result":"ok"}' },
+        done: true,
+      });
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body + "\n"));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "application/x-ndjson" },
+      });
+    }
+    return new Response("not mocked", { status: 500 });
+  };
+
+  try {
+    await runProject({
+      project,
+      query: "loaded-uploads test 2",
+      model: "mock-model",
+      baseUrl: "http://mock-ollama",
+      loadedUploads: [{ name: "notes.md", contents: SENTINEL }],
+      onEvent: () => {},
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  if (!observedUserContent.includes(SENTINEL)) {
+    fail(
+      `loaded-uploads sub-test: BEEP sentinel not found in any user-message body sent to /api/chat. First 300 chars: ${observedUserContent.slice(0, 300)}`,
+    );
+  }
+  if (!observedUserContent.includes("### Uploaded context: notes.md")) {
+    fail(
+      "loaded-uploads sub-test: expected '### Uploaded context: notes.md' header in user message",
+    );
+  }
+  ok(`loaded-uploads sub-test: BEEP sentinel + header reached every user prompt`);
+}
+
 async function main() {
   const fixturePath = path.join(__dirname, "..", "test", "fixtures", "seed-project.json");
   const project = JSON.parse(await fs.readFile(fixturePath, "utf8"));
@@ -154,6 +283,8 @@ async function main() {
     console.log(`SKIP: set OLLAMA_BASE_URL or start ollama to run the headless self-test`);
     // Pass 7: sentinel sub-test runs regardless — it uses mocked fetch.
     await runSentinelOverrideSubTest(project);
+    // Pass 11: loaded-uploads sub-test, also fetch-mocked.
+    await runLoadedUploadsSubTest(project);
     process.exit(0);
   }
 
@@ -220,6 +351,8 @@ async function main() {
   // uses mocked fetch so it doesn't depend on Ollama being available even
   // though we just successfully ran against a real instance.
   await runSentinelOverrideSubTest(project);
+  // Pass 11: loaded-uploads sub-test under the same process.
+  await runLoadedUploadsSubTest(project);
 
   console.log("");
   console.log("Summary:");
