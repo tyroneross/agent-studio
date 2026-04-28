@@ -79,6 +79,50 @@ function edgeId(from, to) {
 const ZOOM_MIN = 0.25;
 const ZOOM_MAX = 2.5;
 
+// Persistence: bump STORAGE_VERSION (and the key suffix) when the persisted shape changes.
+const STORAGE_KEY = "agent-studio:v1";
+const STORAGE_VERSION = 1;
+const PERSIST_DEBOUNCE_MS = 350;
+
+function readPersistedState() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== STORAGE_VERSION) return null;
+    const { nodes, edges, pan, zoom } = parsed;
+    if (!Array.isArray(nodes) || !Array.isArray(edges)) return null;
+    if (!pan || typeof pan.x !== "number" || typeof pan.y !== "number") return null;
+    if (typeof zoom !== "number" || !Number.isFinite(zoom)) return null;
+    return { nodes, edges, pan, zoom };
+  } catch (err) {
+    console.warn("[agent-studio] failed to read persisted state, falling back to seeds:", err);
+    return null;
+  }
+}
+
+function writePersistedState(payload) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ version: STORAGE_VERSION, ...payload }),
+    );
+  } catch (err) {
+    console.warn("[agent-studio] failed to persist state:", err);
+  }
+}
+
+function clearPersistedState() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch (err) {
+    console.warn("[agent-studio] failed to clear persisted state:", err);
+  }
+}
+
 export default function StudioCanvas() {
   const [nodes, setNodes] = useState(SEED_NODES);
   const [edges, setEdges] = useState(SEED_EDGES);
@@ -94,6 +138,10 @@ export default function StudioCanvas() {
 
   const containerRef = useRef(null);
   const dragState = useRef(null); // { type: "pan" | "node" | "connect", nodeId?, startX, startY, startPan, startNode, moved, fromId? }
+  // Persistence guards: hasHydratedRef gates auto-save until the load-from-storage pass has run,
+  // so we never overwrite saved state with seed state on first paint.
+  const hasHydratedRef = useRef(false);
+  const persistTimerRef = useRef(null);
 
   const screenToCanvas = useCallback(
     (sx, sy) => {
@@ -342,6 +390,57 @@ export default function StudioCanvas() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selectedEdgeId, selectedId, connect]);
 
+  // Hydrate from localStorage on mount. We accept one frame of seed state (the initial useState
+  // values) before swapping to persisted state — simpler and SSR-safe.
+  useEffect(() => {
+    const persisted = readPersistedState();
+    if (persisted) {
+      setNodes(persisted.nodes);
+      setEdges(persisted.edges);
+      setPan(persisted.pan);
+      setZoom(persisted.zoom);
+    }
+    hasHydratedRef.current = true;
+    return () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Debounced auto-save. Skipped until hydration completes so we don't clobber persisted state
+  // with seeds on first render. Transient UI state (selection, hover, expand, connect ghost) is
+  // intentionally excluded.
+  useEffect(() => {
+    if (!hasHydratedRef.current) return;
+    if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = setTimeout(() => {
+      writePersistedState({ nodes, edges, pan, zoom });
+      persistTimerRef.current = null;
+    }, PERSIST_DEBOUNCE_MS);
+  }, [nodes, edges, pan, zoom]);
+
+  function clearAll() {
+    if (typeof window !== "undefined" && !window.confirm("Clear the canvas and reset to the seed graph? This will erase saved changes.")) {
+      return;
+    }
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    clearPersistedState();
+    setNodes(SEED_NODES);
+    setEdges(SEED_EDGES);
+    setPan({ x: 0, y: 0 });
+    setZoom(1);
+    setSelectedId(null);
+    setSelectedEdgeId(null);
+    setExpandedId(null);
+    setHoveredNodeId(null);
+    setConnect(null);
+  }
+
   function selectEdge(e, edge) {
     e.stopPropagation();
     setSelectedEdgeId(edge.id);
@@ -416,6 +515,14 @@ export default function StudioCanvas() {
           </button>
           <button className="tool-btn" onClick={resetView} title="Reset view">
             reset
+          </button>
+          <span className="tool-sep" />
+          <button
+            className="tool-btn"
+            onClick={clearAll}
+            title="Clear saved state and reset to seed graph"
+          >
+            clear
           </button>
         </div>
       </header>
