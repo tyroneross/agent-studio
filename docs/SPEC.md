@@ -111,6 +111,34 @@ When a future pass extends the spec, it writes the new field into one of the thr
 
 ---
 
+## Storage limits — `app/lib/storage-config.mjs`
+
+**Added Pass 14.6.** Every storage-related numeric limit in the studio lives in a single config object. Code never inlines magic numbers; the no-hardcoded-storage grep test (`scripts/test-no-hardcoded-storage.mjs`, wired into `npm run test:self`) fails the build if a literal slips in.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `warnLevel` | 70 | % full at which the toolbar storage pill turns amber. |
+| `blockLevel` | 90 | % full at which the save preflight intercepts saves. |
+| `runCacheBytesPerEntry` | 100_000 | Hard cap per cached node output. Above this, the entry is truncated with a marker; full payload is written to `<workingFolder>/runs/<ts>-solo-<nodeId>/`. |
+| `runCacheEntriesPerNode` | 1 | Cached runs per node. Pass 14 ships single-entry; future passes can increase. |
+| `snapshotsPerProject` | 50 | Older snapshots dropped silently above this cap. |
+| `autoSnapshotWhenLow` | true | When false, the auto-snapshot before restore/reopen is skipped at block level (with a one-time toast). |
+
+**Storage:** user-level (not project-level), keyed `agent-studio:storage-config:v1` in localStorage. Changes apply immediately to subsequent saves; no reload needed.
+
+**Consumers** (every file that respects a storage limit):
+
+- `app/lib/projects.js` — `getSnapshotsPerProjectCap()`, `withRunCacheEntry()` (truncation hook).
+- `app/api/agent/run-node/route.js` — applies `runCacheBytesPerEntry`, writes truncation transcript when triggered.
+- `app/components/SoloRunModal.js` — passes the user's config to the route; surfaces the truncation hint.
+- `app/components/StoragePill.js` — reads `warnLevel` / `blockLevel` to classify usage.
+- `app/components/StoragePanel.js` — slide-over UI: status, "what's using space", settings.
+- `app/canvas/page.js` — save preflight, low-storage toast, trim handlers wired into the panel.
+
+**Rule:** if you add or change a storage-related limit, add the field to `DEFAULT_STORAGE_CONFIG`, surface it in `StoragePanel`'s settings section, document it here, and let the grep test confirm no inline literal slipped in.
+
+---
+
 ## What this contract guarantees, and what it does not
 
 It guarantees:

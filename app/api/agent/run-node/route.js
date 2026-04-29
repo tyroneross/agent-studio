@@ -27,6 +27,10 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { runProject, planExecution } from "../../../lib/agent-runtime.mjs";
+import {
+  DEFAULT_STORAGE_CONFIG,
+  truncateOutputForCache,
+} from "../../../lib/storage-config.mjs";
 
 export const runtime = "nodejs";
 
@@ -167,6 +171,46 @@ function buildSoloSubProject(project, nodeId, soloInputs) {
   };
 }
 
+// Pass 14.6 — write a transcript file when a solo run's output exceeds
+// `runCacheBytesPerEntry`. Mirrors /api/agent/run's <workingFolder>/runs/<ts>
+// layout so the on-disk shape is consistent between full-graph and solo
+// runs. Returns the absolute path on success, "" on failure (caller surfaces
+// a warning event but doesn't fail the run).
+async function writeTruncationTranscript({ project, nodeId, fullPayload, transcript, storageConfig: _cfg }) {
+  void _cfg; // reserved for future per-write byte-cap policies
+  const wfRaw = project?.workingFolder;
+  if (!wfRaw || typeof wfRaw !== "string" || !wfRaw.startsWith("/")) {
+    return "";
+  }
+  const wfAbs = path.resolve(wfRaw);
+  if (!isPermittedFolder(wfAbs)) return "";
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const dir = path.join(wfAbs, "runs", `${ts}-solo-${nodeId}`);
+  await fs.mkdir(dir, { recursive: true });
+  const transcriptPath = path.join(dir, "transcript.json");
+  const fullPayloadPath = path.join(dir, "output.json");
+  const minimalTranscript = transcript ?? {
+    project: project.id,
+    projectName: project.name,
+    nodes: [
+      {
+        id: nodeId,
+        title: project.canvas.nodes[0]?.title ?? nodeId,
+        role: project.canvas.nodes[0]?.role ?? "agent",
+        output: typeof fullPayload === "string" ? fullPayload : JSON.stringify(fullPayload),
+      },
+    ],
+    truncated: true,
+  };
+  await fs.writeFile(transcriptPath, JSON.stringify(minimalTranscript, null, 2), "utf8");
+  await fs.writeFile(
+    fullPayloadPath,
+    typeof fullPayload === "string" ? fullPayload : JSON.stringify(fullPayload, null, 2),
+    "utf8",
+  );
+  return transcriptPath;
+}
+
 export async function POST(request) {
   let body;
   try {
@@ -179,6 +223,14 @@ export async function POST(request) {
   const nodeId = typeof body?.nodeId === "string" ? body.nodeId : "";
   const soloInputs = "inputs" in (body ?? {}) ? body.inputs : undefined;
   const model = typeof body?.model === "string" && body.model ? body.model : undefined;
+  // Pass 14.6 — the client passes its loaded storage-config so the server
+  // applies the same byte cap when truncating cached outputs. Falls back to
+  // DEFAULT_STORAGE_CONFIG when the client doesn't supply one (older
+  // callers, server-side tests). Only `runCacheBytesPerEntry` matters here.
+  const storageConfig =
+    body?.storageConfig && typeof body.storageConfig === "object"
+      ? body.storageConfig
+      : DEFAULT_STORAGE_CONFIG;
 
   if (!project || !project.canvas || !Array.isArray(project.canvas.nodes)) {
     return Response.json(
@@ -246,6 +298,14 @@ export async function POST(request) {
         });
 
         let cacheEntry = null;
+        // Pass 14.6 — when truncation kicks in we write a transcript to disk
+        // so the user has the full payload, then point the cache marker at
+        // it. We defer the write until we know there's something to truncate
+        // (keeps the disk side cheap for the typical small-output case).
+        let pendingFullPayload = null;
+        let pendingFullTranscript = null;
+        let truncationOccurred = false;
+        let transcriptDiskPath = "";
 
         const { transcript } = await runProject({
           project: soloProject,
@@ -260,22 +320,69 @@ export async function POST(request) {
             // to update localStorage without re-deriving from the transcript.
             if (evt.type === "node-end") {
               const payload = evt.parsed != null ? evt.parsed : evt.output;
+              // Pre-truncation byte check. We don't yet know the on-disk
+              // path; pass an empty string and patch the marker after we
+              // write the transcript.
+              const probe = truncateOutputForCache(payload, storageConfig, "");
+              if (probe.truncated) {
+                truncationOccurred = true;
+                pendingFullPayload = payload;
+              }
               cacheEntry = {
                 input: soloInputs ?? null,
-                output: payload,
+                output: probe.output,
                 ts: new Date().toISOString(),
+                ...(probe.truncated ? { truncated: true } : {}),
               };
             }
             if (evt.type === "complete") {
-              // Pass 14 — never write disk artifacts on a solo run; the cache
-              // is the canonical record. Strip transcript+brief from the
-              // emitted event to keep frames lean (the client doesn't need
-              // them — it derives state from `node-end`).
-              send({
-                type: "complete",
-                soloNodeId: nodeId,
-                runCacheEntry: cacheEntry,
-              });
+              // Pass 14.6 — only write a transcript on truncation; otherwise
+              // keep the disk side untouched (Pass 14 contract).
+              const finishComplete = (entry) => {
+                send({
+                  type: "complete",
+                  soloNodeId: nodeId,
+                  runCacheEntry: entry,
+                });
+              };
+              if (truncationOccurred) {
+                pendingFullTranscript = evt.transcript ?? transcript ?? null;
+                writeTruncationTranscript({
+                  project: soloProject,
+                  nodeId,
+                  fullPayload: pendingFullPayload,
+                  transcript: pendingFullTranscript,
+                  storageConfig,
+                })
+                  .then((diskPath) => {
+                    transcriptDiskPath = diskPath || "";
+                    if (cacheEntry) {
+                      // Re-truncate with the now-known path so the marker
+                      // points to the saved transcript.
+                      const final = truncateOutputForCache(
+                        pendingFullPayload,
+                        storageConfig,
+                        transcriptDiskPath,
+                      );
+                      cacheEntry = {
+                        ...cacheEntry,
+                        output: final.output,
+                        truncated: true,
+                        transcriptPath: transcriptDiskPath,
+                      };
+                    }
+                    finishComplete(cacheEntry);
+                  })
+                  .catch((err) => {
+                    send({
+                      type: "warning",
+                      text: `transcript write failed: ${err?.message || "io"}`,
+                    });
+                    finishComplete(cacheEntry);
+                  });
+                return;
+              }
+              finishComplete(cacheEntry);
             } else {
               send(evt);
             }

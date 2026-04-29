@@ -17,6 +17,7 @@ The four items previously queued (lasso + group drag, LLM-inferred dependencies,
 | 13 | UI polish — selection model upgrade | Lasso + group drag on canvas |
 | 14 | Single-node solo run + portable spec contract | "Solo run" mode + per-node fixtures + frozen export schema + round-trip harness |
 | 14.5 | Save snapshots + completion flag + single-file markdown export | Named project snapshots, "completed" status, round-trip-safe `agent.md` |
+| 14.6 | Storage-aware saving | Quota detection, plain-language save preflight, configurable limits, no hardcoded thresholds |
 | 15 | Run inspector + step-through + per-node mocks | Inspector panel, level-by-level step mode, mock outputs |
 | 16 | Inferred edge ordering for sparse graphs | LLM-inferred dependencies; accepted edges write back to spec |
 | 17 | Spec export UI | Export / import `agent.yaml` + `tools.json` + `system-prompt.md` (schema already exists from Pass 14) |
@@ -199,6 +200,89 @@ autonomy: human-in-loop
 10. **Portability:** Existing `spec/` round-trip from Pass 14 still passes. The new `agent.md` round-trip is additive.
 11. Schema bump v5 → v6 with chained migration; v5 stores upgrade additively (snapshots: [], status: "draft").
 12. Pass 1-14 regressions all pass — `npm run test:self` chains both round-trips.
+
+### Build-loop passes: **1-2**.
+
+---
+
+## Pass 14.6 — Storage-aware saving
+
+### Why now
+
+Pass 14.5 unlocked snapshots and run-cache, both of which write to the browser's localStorage. localStorage is per-origin and has a hard cap (typically a few MB; varies by browser). A user who saves 30 snapshots of a 20-node project, or runs solo a few hundred times, can silently fill the quota and then experience a confusing save failure with no recovery affordance. Pass 14.6 makes the limits visible, the warnings intuitive, and the controls user-tunable. **No hardcoded thresholds anywhere.**
+
+### Design principle
+
+The user shouldn't see percentages or byte counts. They should see plain-language status (*"plenty of room"*, *"getting full"*, *"almost out"*) and a single settings page where they can adjust what those phrases mean if they want to. Every numeric limit lives in a single config object, persisted with the user's profile in localStorage. Code reads from that config — never from inline literals.
+
+### Design
+
+**1. Storage settings live in one place.**
+New per-user (not per-project) localStorage entry: `agent-studio:storage-config:v1`. Shape:
+
+```ts
+{
+  warnLevel: number,        // % full at which the status pill turns amber. Default 70.
+  blockLevel: number,       // % full at which saves require explicit override. Default 90.
+  runCacheBytesPerEntry: number,    // hard cap per cached node output. Default 100_000 (100 KB).
+  runCacheEntriesPerNode: number,   // count cap. Default 1.
+  snapshotsPerProject: number,      // count cap. Default 50.
+  autoSnapshotWhenLow: boolean,     // skip auto-snapshot before restore/reopen if at blockLevel. Default true.
+}
+```
+
+The defaults sit in a single exported `DEFAULT_STORAGE_CONFIG` constant in `app/lib/storage-config.mjs`. Every consumer (snapshot writer, runCache writer, status pill) imports from this module. **Code never references magic numbers.**
+
+**2. Toolbar storage pill (always visible).**
+Shows one of three plain-language states based on `usage / quota` vs `warnLevel` / `blockLevel`:
+- **Plenty of room** — green dot, no number.
+- **Getting full** — amber dot, *"~3 saves left"* (estimated by snapshot bytes / available bytes).
+- **Almost out** — red dot, *"out of space — manage storage"*.
+
+Click opens a slide-over panel.
+
+**3. Storage panel (slide-over, not modal).**
+Three sections:
+
+- **Status** — *"You've used 4.1 MB of about 5 MB. About 12 saves of recent size still fit."* Plain language, no percent symbols by default. Tiny "show numbers" toggle reveals % + raw bytes for power users.
+- **What's using space** — table of projects with name + bytes + snapshot count + cache count. Each row has a *"trim run cache"* and *"delete oldest snapshots"* action with a count picker. No bulk-delete-all (too dangerous).
+- **Settings** — five labeled fields with helper text explaining what each does in one sentence. Fields show *current value* (e.g. "70" for warnLevel) plus a "reset to default" link per field. Constants come from `DEFAULT_STORAGE_CONFIG`, never inline.
+
+**4. Save preflight.**
+Before any snapshot write, compute projected post-save usage. If projected usage crosses `blockLevel`, intercept the save action with a small confirm:
+
+> *"This save would leave you almost out of space. You can save anyway, or trim older snapshots first."*
+> [Trim & save] [Save anyway] [Cancel]
+
+If `autoSnapshotWhenLow` is false and the source action was an auto-snapshot (before restore / before reopen), skip silently with a one-time toast: *"Auto-snapshot skipped — storage is low. Save manually first if you want a recovery point."*
+
+**5. RunCache byte cap.**
+The runCache writer reads `runCacheBytesPerEntry` from config. If a node's output exceeds the cap, truncate the output string with a marker:
+
+```
+... [truncated — full transcript at <workingFolder>/runs/<ts>/transcript.json]
+```
+
+The full transcript is already written to disk by `runProject` for full-graph runs. For solo runs this pass extends `/api/agent/run-node` to also write a transcript when truncation occurs (only then — keeps the disk side cheap).
+
+**6. Quota detection.**
+On app load and on every save attempt, call `navigator.storage.estimate()`. Cache result for 30s to avoid hammering the API. Fall back gracefully if the API isn't available (older browsers): pill shows *"unknown"* and skips the preflight gate.
+
+**7. Documentation.**
+`docs/SPEC.md` adds a Storage section: documents the config shape, the defaults, the consumer modules. Reinforces the "no magic numbers" rule.
+
+### Acceptance
+
+1. `app/lib/storage-config.mjs` exists with `DEFAULT_STORAGE_CONFIG` exported. **Every** numeric limit in the codebase that affects storage (snapshots, runCache bytes, runCache count, warn/block thresholds) reads from this module. Grep proves no inline literals remain in `projects.js`, `markdown-export.mjs`, `spec-export.mjs`, `SoloRunModal.js`, or `canvas/page.js`.
+2. Toolbar pill renders one of three plain-language states; click opens the storage panel.
+3. Storage panel shows usage in plain language; "show numbers" toggle reveals percentages and raw bytes.
+4. "What's using space" lists every project with bytes / snapshots / cache; trim and delete-oldest actions work and update the panel without reload.
+5. Settings section lets the user change every field in `DEFAULT_STORAGE_CONFIG`; "reset to default" restores per-field; values persist to `agent-studio:storage-config:v1`.
+6. Save preflight intercepts saves at `blockLevel`; user choices (trim & save / save anyway / cancel) all work.
+7. RunCache truncation kicks in at `runCacheBytesPerEntry`; truncated entries carry the marker; solo-run transcript is written to disk only on truncation.
+8. `navigator.storage.estimate()` failure falls back gracefully — pill shows "unknown", preflight skipped, no crashes.
+9. **No hardcoded data:** automated grep test in `scripts/test-no-hardcoded-storage.mjs` fails the build if any of `projects.js`, `markdown-export.mjs`, `spec-export.mjs`, `SoloRunModal.js`, `canvas/page.js`, `agent-runtime.mjs` contain numeric literals matching common storage limits (50, 100, 70, 90, 100_000) outside of `DEFAULT_STORAGE_CONFIG` itself.
+10. Pass 1-14.5 regressions all pass — `npm run test:self` includes the no-hardcoded-storage check.
 
 ### Build-loop passes: **1-2**.
 

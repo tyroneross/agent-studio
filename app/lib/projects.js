@@ -59,6 +59,11 @@ import {
   findPatternById,
   canvasFromPattern,
 } from "./agent-patterns.js";
+import {
+  loadStorageConfig,
+  DEFAULT_STORAGE_CONFIG,
+  truncateOutputForCache,
+} from "./storage-config.mjs";
 
 export const STORAGE_KEY_V1 = "agent-studio:v1";
 export const STORAGE_KEY_V2 = "agent-studio:v2";
@@ -71,10 +76,21 @@ export const STORAGE_VERSION_V4 = 4;
 export const STORAGE_VERSION_V5 = 5;
 export const STORAGE_VERSION_V6 = 6;
 
-// Pass 14.5 — cap snapshots per project. Older snapshots silently dropped
-// beyond the cap with a one-time console warn. Constant lifted so a future
-// quota guard can change the budget without touching call sites.
-export const SNAPSHOTS_PER_PROJECT_CAP = 50;
+// Pass 14.6 — read snapshot cap from storage-config. Falls back to the
+// frozen default when the runtime hasn't loaded localStorage yet (server
+// side). The user-facing storage panel is the only place that mutates this
+// value; consumers always read live so a settings change takes effect on
+// the next save without a reload.
+export function getSnapshotsPerProjectCap() {
+  if (typeof window === "undefined") return DEFAULT_STORAGE_CONFIG.snapshotsPerProject;
+  return loadStorageConfig().snapshotsPerProject;
+}
+
+// Pass 14.5 → 14.6 — historical export retained as a thin wrapper so any
+// downstream caller that imported the old constant keeps working. The
+// returned value is now dynamic; callers that captured it once at module
+// load time should switch to `getSnapshotsPerProjectCap()`.
+export const SNAPSHOTS_PER_PROJECT_CAP = DEFAULT_STORAGE_CONFIG.snapshotsPerProject;
 
 // Pass 9: seed comes from the canonical Solo Tool Agent pattern. We expose
 // SEED_NODES / SEED_EDGES as plain arrays for backward compatibility — older
@@ -174,11 +190,14 @@ function normalizeNode(n) {
   return out;
 }
 
-// Pass 14: defensive normalization for the per-project run cache. Strips
-// anything malformed and trims to last-N-runs per node. `cap` is exposed so a
-// future quota guard can shrink it without changing call sites. Default N=1.
-const RUN_CACHE_PER_NODE_CAP = 1;
-
+// Pass 14 → 14.6: defensive normalization for the per-project run cache.
+// Strips malformed entries and respects the cache shape (single entry per
+// node — N=1 today). The N-cap, the bytes-per-entry cap, and the truncation
+// marker all live in `app/lib/storage-config.mjs` so the no-hardcoded-storage
+// guard has a single source of truth. The shape stays a single {input,
+// output, ts, truncated?} object per node; if a future pass extends to last-N
+// we'll replace the value with an array and apply
+// `runCacheEntriesPerNode` here without touching consumers.
 function normalizeRunCache(cache) {
   if (!cache || typeof cache !== "object") return {};
   const out = {};
@@ -190,12 +209,11 @@ function normalizeRunCache(cache) {
       input: value.input ?? null,
       output: value.output,
       ts: typeof value.ts === "string" ? value.ts : new Date().toISOString(),
+      // truncated is studio-only metadata so the SoloRunModal can render a
+      // "transcript on disk" hint. Optional — older v6 entries default to
+      // false.
+      ...(value.truncated === true ? { truncated: true } : {}),
     };
-    // Pass 14 ships single-entry cache (N=1). The shape is a single
-    // {input,output,ts} object today; if a future pass extends to last-N we
-    // can replace the value with an array and apply RUN_CACHE_PER_NODE_CAP
-    // here without touching consumers.
-    void RUN_CACHE_PER_NODE_CAP;
   }
   return out;
 }
@@ -249,13 +267,14 @@ function normalizeSnapshots(snapshots) {
       projectFrozen: s.projectFrozen,
     });
   }
-  if (cleaned.length > SNAPSHOTS_PER_PROJECT_CAP) {
+  const cap = getSnapshotsPerProjectCap();
+  if (cleaned.length > cap) {
     if (typeof console !== "undefined") {
       console.warn(
-        `[agent-studio] dropping ${cleaned.length - SNAPSHOTS_PER_PROJECT_CAP} snapshot(s) over cap (${SNAPSHOTS_PER_PROJECT_CAP})`,
+        `[agent-studio] dropping ${cleaned.length - cap} snapshot(s) over cap (${cap})`,
       );
     }
-    return cleaned.slice(0, SNAPSHOTS_PER_PROJECT_CAP);
+    return cleaned.slice(0, cap);
   }
   return cleaned;
 }
@@ -536,22 +555,41 @@ export function getActiveProject(store) {
   return store.projects.find((p) => p.id === store.activeProjectId) ?? store.projects[0] ?? null;
 }
 
-// Pass 14: write a single solo-run result into a project's runCache. Pure —
-// returns a new project object. The output payload is whatever the runtime
-// produced (parsed JSON preferred, raw text fallback). `ts` defaults to now.
-// Cache shape stays single-entry per node (N=1) per Pass 14 research-recommended
-// default.
+// Pass 14 → 14.6: write a single solo-run result into a project's runCache.
+// Pure — returns a new project object. The output payload is whatever the
+// runtime produced (parsed JSON preferred, raw text fallback). The byte cap
+// (`runCacheBytesPerEntry` from storage-config) is applied here so the cache
+// can never grow past the user's configured budget. When the entry was
+// truncated server-side the route already replaced `output` with a
+// truncation marker; this function honors that marker. When the route did
+// NOT truncate (older API), we still apply the cap here as belt-and-braces.
+//
+// Cache shape stays single-entry per node (N=1) per Pass 14 research
+// recommendation; `runCacheEntriesPerNode` from storage-config governs the
+// future N>1 case.
 export function withRunCacheEntry(project, nodeId, entry) {
   if (!project || typeof project !== "object") return project;
   if (typeof nodeId !== "string" || !nodeId) return project;
+
+  const cfg = typeof window === "undefined" ? DEFAULT_STORAGE_CONFIG : loadStorageConfig();
+  const incomingTruncated = entry?.truncated === true;
+  let output = entry?.output ?? null;
+  let truncated = incomingTruncated;
+  if (!incomingTruncated) {
+    const result = truncateOutputForCache(output, cfg, entry?.transcriptPath ?? "");
+    output = result.output;
+    truncated = result.truncated;
+  }
+
   const next = {
     ...project,
     runCache: {
       ...(project.runCache ?? {}),
       [nodeId]: {
         input: entry?.input ?? null,
-        output: entry?.output ?? null,
+        output,
         ts: typeof entry?.ts === "string" ? entry.ts : new Date().toISOString(),
+        ...(truncated ? { truncated: true } : {}),
       },
     },
   };
@@ -598,13 +636,14 @@ export function withSnapshotAdded(project, name) {
     projectFrozen: freezeForSnapshot(project),
   };
   let snapshots = [snapshot, ...(Array.isArray(project.snapshots) ? project.snapshots : [])];
-  if (snapshots.length > SNAPSHOTS_PER_PROJECT_CAP) {
+  const cap = getSnapshotsPerProjectCap();
+  if (snapshots.length > cap) {
     if (typeof console !== "undefined") {
       console.warn(
         `[agent-studio] snapshot cap reached for project ${project.id}; dropping oldest`,
       );
     }
-    snapshots = snapshots.slice(0, SNAPSHOTS_PER_PROJECT_CAP);
+    snapshots = snapshots.slice(0, cap);
   }
   return { ...project, snapshots };
 }

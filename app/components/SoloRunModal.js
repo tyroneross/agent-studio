@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { loadStorageConfig, TRUNCATION_MARKER_PREFIX } from "../lib/storage-config.mjs";
 
 // Pass 14 — Solo Run modal.
 //
@@ -141,6 +142,9 @@ export default function SoloRunModal({ project, node, onClose, onComplete }) {
     abortRef.current = ac;
 
     try {
+      // Pass 14.6 — pass the user's storage-config so the server applies the
+      // same byte cap when truncating cached outputs.
+      const storageConfig = loadStorageConfig();
       const res = await fetch("/api/agent/run-node", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -148,6 +152,7 @@ export default function SoloRunModal({ project, node, onClose, onComplete }) {
           project,
           nodeId: node.id,
           inputs,
+          storageConfig,
         }),
         signal: ac.signal,
       });
@@ -294,9 +299,17 @@ export default function SoloRunModal({ project, node, onClose, onComplete }) {
                 <div className="solo-run-meta">{bytes.toLocaleString()} bytes</div>
               )}
               {output != null && (
-                <pre className="solo-run-output">
-                  {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
-                </pre>
+                <>
+                  <pre className="solo-run-output">
+                    {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
+                  </pre>
+                  {typeof output === "string" && output.includes(TRUNCATION_MARKER_PREFIX) && (
+                    <p className="solo-run-hint" data-solo-run-truncated>
+                      Output exceeded the cache size cap. The full payload was written to the
+                      project working folder; see the marker above for the path.
+                    </p>
+                  )}
+                </>
               )}
               {error && <div className="solo-run-error">{error}</div>}
               {warnings.length > 0 && (

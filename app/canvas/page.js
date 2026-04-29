@@ -5,6 +5,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ProjectSwitcher from "../components/ProjectSwitcher";
 import SoloRunModal from "../components/SoloRunModal";
+import StoragePanel from "../components/StoragePanel";
+import StoragePill from "../components/StoragePill";
 import TestPanel from "../components/TestPanel";
 import WelcomeModal from "../components/WelcomeModal";
 import WorkingFolderInput from "../components/WorkingFolderInput";
@@ -31,6 +33,14 @@ import {
   exportProjectToMarkdown,
   importMarkdownToProject,
 } from "../lib/markdown-export.mjs";
+import {
+  approxProjectBytes,
+  approxSnapshotBytes,
+  clearQuotaCache,
+  getStorageEstimate,
+  loadStorageConfig,
+  preflightVerdict,
+} from "../lib/storage-config.mjs";
 
 const ROLE_COLORS = {
   agent: { soft: "var(--accent-soft)", border: "var(--accent)" },
@@ -83,6 +93,14 @@ export default function StudioCanvas() {
   // node-bound; closing it clears the binding.
   const [soloRunNodeId, setSoloRunNodeId] = useState(null);
   const [contextMenu, setContextMenu] = useState(null); // { x, y, nodeId } | null
+
+  // Pass 14.6 — storage panel slide-over + a one-shot toast queue. Toasts
+  // surface low-storage events (auto-snapshot skipped, save preflight) so the
+  // user knows why a save behaved differently than expected.
+  const [storagePanelOpen, setStoragePanelOpen] = useState(false);
+  const [storageRefreshKey, setStorageRefreshKey] = useState(0);
+  const [storageToast, setStorageToast] = useState(null); // { text } | null
+  const skippedAutoSnapshotShownRef = useRef(false);
 
   const containerRef = useRef(null);
   const dragState = useRef(null);
@@ -617,11 +635,73 @@ export default function StudioCanvas() {
     setSoloRunNodeId(nodeId);
   }, [locked]);
 
-  // Pass 14.5 — Save snapshot. Prompts for a name and prepends a snapshot to
-  // the active project. We flush the live canvas state into the project
-  // first (the debounced auto-save may not have fired yet) so the snapshot
-  // captures what the user sees, not the last persisted version.
-  function saveSnapshot() {
+  // Pass 14.6 — storage panel handlers + recent-save bytes for the pill's
+  // "saves left" estimate. We use the median of the active project's last
+  // few snapshot byte sizes; falls back to the project byte size when no
+  // snapshots exist yet.
+  const bytesPerRecentSave = useMemo(() => {
+    if (!activeProject) return 0;
+    const snaps = activeProject.snapshots ?? [];
+    if (snaps.length === 0) {
+      return approxProjectBytes(activeProject);
+    }
+    const recent = snaps.slice(0, Math.min(snaps.length, 5));
+    const sizes = recent.map((s) => approxSnapshotBytes(s)).sort((a, b) => a - b);
+    return sizes[Math.floor(sizes.length / 2)] || 0;
+  }, [activeProject]);
+
+  const handleTrimRunCache = useCallback((projectId) => {
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(prev, projectId, (p) => withRunCacheCleared(p));
+      writeStore(next);
+      return next;
+    });
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleDeleteOldestSnapshots = useCallback((projectId, count) => {
+    const n = Math.max(1, Number(count) || 1);
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(
+        prev,
+        projectId,
+        (p) => {
+          const list = Array.isArray(p.snapshots) ? p.snapshots : [];
+          if (list.length === 0) return p;
+          return { ...p, snapshots: list.slice(0, Math.max(0, list.length - n)) };
+        },
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      return next;
+    });
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleStorageConfigChanged = useCallback(() => {
+    // The pill re-reads on its own interval but a settings change should
+    // re-evaluate immediately.
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
+  }, []);
+
+  // Pass 14.5 → 14.6 — Save snapshot with storage preflight.
+  // We flush the live canvas state into the project first (the debounced
+  // auto-save may not have fired yet) so the snapshot captures what the user
+  // sees, not the last persisted version. Before writing we project the
+  // post-save usage; if it would cross the user's `blockLevel`, we surface a
+  // confirm with three options:
+  //   - Trim & save (auto-deletes the oldest snapshot for the active
+  //     project, then proceeds)
+  //   - Save anyway
+  //   - Cancel
+  // When `navigator.storage.estimate()` is unavailable we skip the gate
+  // (per design: don't block on missing data).
+  async function saveSnapshot() {
     if (!store) return;
     if (typeof window === "undefined") return;
     const defaultName = `Snapshot ${new Date().toLocaleString()}`;
@@ -633,24 +713,71 @@ export default function StudioCanvas() {
       clearTimeout(persistTimerRef.current);
       persistTimerRef.current = null;
     }
+
+    // Estimate the bytes the new snapshot will add. The snapshot is a deep
+    // clone of the project minus snapshots + minus runCache; project size
+    // is a tight upper bound for that.
+    const liveProjectForBytes = liveProject
+      ? { ...liveProject, snapshots: [], runCache: {} }
+      : null;
+    const projectedAdd = liveProjectForBytes ? approxSnapshotBytes({ projectFrozen: liveProjectForBytes, name: trimmed, id: "x", createdAt: "x" }) : 0;
+    const estimate = await getStorageEstimate({ force: false });
+    const cfg = loadStorageConfig();
+    const verdict = preflightVerdict(estimate, cfg, projectedAdd);
+
+    let trimFirst = false;
+    if (verdict.intercept) {
+      // Use a single confirm with explicit text mapping to the design's
+      // three-button modal. Browsers don't have a native 3-button confirm so
+      // we chain two prompts: the first asks whether to proceed at all, the
+      // second whether to trim oldest first.
+      const proceed = window.confirm(
+        "This save would leave your browser storage almost full.\n\n[OK] save anyway\n[Cancel] back out\n\nAfter you click OK you can also choose to trim the oldest snapshot first.",
+      );
+      if (!proceed) return;
+      trimFirst = window.confirm(
+        "Trim the oldest snapshot before saving? Click OK to trim, Cancel to save without trimming.",
+      );
+    }
+
     setStore((prev) => {
       if (!prev) return prev;
       // Flush the live canvas first (allowed even when locked is false).
-      const flushed = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+      let working = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+      if (trimFirst) {
+        // Drop the oldest snapshot for the active project before adding the
+        // new one. Keeps the panel's "delete oldest" affordance reusable.
+        working = withProjectUpdated(
+          working,
+          working.activeProjectId,
+          (p) => {
+            const list = Array.isArray(p.snapshots) ? p.snapshots : [];
+            if (list.length === 0) return p;
+            return { ...p, snapshots: list.slice(0, list.length - 1) };
+          },
+          { allowOnLocked: true },
+        );
+      }
       // withSnapshotAdded is allowed on completed projects too.
       const next = withProjectUpdated(
-        flushed,
-        flushed.activeProjectId,
+        working,
+        working.activeProjectId,
         (p) => withSnapshotAdded(p, trimmed),
         { allowOnLocked: true },
       );
       writeStore(next);
       return next;
     });
+    // Force the pill to refresh now that we've written.
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
   }
 
-  // Pass 14.5 — Restore a snapshot. Auto-snapshots first via withSnapshotRestored.
-  function restoreSnapshot(snapshotId) {
+  // Pass 14.5 → 14.6 — Restore a snapshot. Auto-snapshots first by default,
+  // unless the user has turned off `autoSnapshotWhenLow` and storage is at
+  // block level — in that case we skip the auto-snap silently and emit a
+  // one-time toast so the user knows why.
+  async function restoreSnapshot(snapshotId) {
     if (!store) return;
     if (typeof window === "undefined") return;
     if (!window.confirm("Restore this snapshot? Your current canvas will be auto-saved as a snapshot first.")) return;
@@ -658,6 +785,28 @@ export default function StudioCanvas() {
       clearTimeout(persistTimerRef.current);
       persistTimerRef.current = null;
     }
+
+    // Decide whether to skip the auto-snapshot.
+    const cfg = loadStorageConfig();
+    let skipAuto = false;
+    if (!cfg.autoSnapshotWhenLow) {
+      const estimate = await getStorageEstimate({ force: false });
+      if (estimate.supported && estimate.quota) {
+        const pct = (estimate.usage ?? 0) / estimate.quota * 100;
+        if (pct >= cfg.blockLevel) {
+          skipAuto = true;
+          if (!skippedAutoSnapshotShownRef.current) {
+            skippedAutoSnapshotShownRef.current = true;
+            setStorageToast({
+              text:
+                "Auto-snapshot skipped — storage is low. Save manually first if you want a recovery point.",
+            });
+            window.setTimeout(() => setStorageToast(null), 5_000);
+          }
+        }
+      }
+    }
+
     setStore((prev) => {
       if (!prev) return prev;
       // Flush live state into the project so the auto-snapshot inside
@@ -666,7 +815,24 @@ export default function StudioCanvas() {
       const next = withProjectUpdated(
         flushed,
         flushed.activeProjectId,
-        (p) => withSnapshotRestored(p, snapshotId),
+        (p) => {
+          if (skipAuto) {
+            // Manually mirror withSnapshotRestored without the auto-save
+            // sub-step. Fetch frozen state from the snapshot list and apply.
+            const list = Array.isArray(p.snapshots) ? p.snapshots : [];
+            const target = list.find((s) => s.id === snapshotId);
+            if (!target || !target.projectFrozen) return p;
+            const frozen = target.projectFrozen;
+            return {
+              ...frozen,
+              id: p.id,
+              status: p.status === "completed" ? "completed" : "draft",
+              snapshots: list,
+              runCache: {},
+            };
+          }
+          return withSnapshotRestored(p, snapshotId);
+        },
         { allowOnLocked: true },
       );
       writeStore(next);
@@ -686,6 +852,8 @@ export default function StudioCanvas() {
       }
       return next;
     });
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
   }
 
   function deleteSnapshot(snapshotId) {
@@ -728,14 +896,35 @@ export default function StudioCanvas() {
     });
   }
 
-  function reopenProject() {
+  async function reopenProject() {
     if (!store) return;
+    // Pass 14.6 — honor `autoSnapshotWhenLow=false` at block level.
+    const cfg = loadStorageConfig();
+    let skipAuto = false;
+    if (!cfg.autoSnapshotWhenLow) {
+      const estimate = await getStorageEstimate({ force: false });
+      if (estimate.supported && estimate.quota) {
+        const pct = (estimate.usage ?? 0) / estimate.quota * 100;
+        if (pct >= cfg.blockLevel) {
+          skipAuto = true;
+          if (!skippedAutoSnapshotShownRef.current && typeof window !== "undefined") {
+            skippedAutoSnapshotShownRef.current = true;
+            setStorageToast({
+              text:
+                "Auto-snapshot skipped — storage is low. Save manually first if you want a recovery point.",
+            });
+            window.setTimeout(() => setStorageToast(null), 5_000);
+          }
+        }
+      }
+    }
     setStore((prev) => {
       if (!prev) return prev;
       const next = withProjectUpdated(
         prev,
         prev.activeProjectId,
         (p) => {
+          if (skipAuto) return withStatusChanged(p, "draft");
           const snapped = withSnapshotAdded(p, `Completed ${new Date().toISOString()}`);
           return withStatusChanged(snapped, "draft");
         },
@@ -744,6 +933,8 @@ export default function StudioCanvas() {
       writeStore(next);
       return next;
     });
+    clearQuotaCache();
+    setStorageRefreshKey((k) => k + 1);
   }
 
   // Pass 14.5 — Export markdown. Serializes the live project (so the user's
@@ -1111,6 +1302,12 @@ export default function StudioCanvas() {
             import markdown
           </button>
           <span className="tool-sep" />
+          {/* Pass 14.6 — toolbar storage pill. Click opens the slide-over. */}
+          <StoragePill
+            onOpen={() => setStoragePanelOpen(true)}
+            bytesPerRecentSave={bytesPerRecentSave}
+            refreshKey={storageRefreshKey}
+          />
           <button
             className="tool-btn tool-help"
             onClick={reopenWelcome}
@@ -1457,6 +1654,21 @@ export default function StudioCanvas() {
 
       <WelcomeModal open={welcomeOpen} onDismiss={dismissWelcome} />
 
+      {/* Pass 14.6 — storage slide-over panel + low-storage toast. */}
+      <StoragePanel
+        open={storagePanelOpen}
+        onClose={() => setStoragePanelOpen(false)}
+        store={store}
+        onTrimRunCache={handleTrimRunCache}
+        onDeleteOldestSnapshots={handleDeleteOldestSnapshots}
+        onConfigChanged={handleStorageConfigChanged}
+      />
+      {storageToast && (
+        <div className="studio-toast" role="status" data-storage-toast>
+          {storageToast.text}
+        </div>
+      )}
+
       <style jsx>{`
         .studio-shell {
           position: fixed;
@@ -1554,6 +1766,20 @@ export default function StudioCanvas() {
           font-size: 13px;
           text-align: center;
           font-weight: 500;
+        }
+        .studio-toast {
+          position: fixed;
+          bottom: 20px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: var(--ink, #1f2520);
+          color: var(--surface, #fff);
+          padding: 10px 16px;
+          border-radius: 8px;
+          font-size: 13px;
+          z-index: 70;
+          box-shadow: var(--shadow-lift);
+          max-width: 480px;
         }
         .studio-canvas {
           position: relative;
