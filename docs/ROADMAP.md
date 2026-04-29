@@ -1,25 +1,40 @@
 # Agent Studio — Roadmap
 
-> Drafted 2026-04-28 after Pass 12. Frames the next ~5 build-loop passes as a coherent sequence with the **discrete-event-simulation (DES)** workbench as the centerpiece, with the four previously queued items absorbed into the same plan.
+> Drafted 2026-04-28 after Pass 12. Reframed 2026-04-28: product is a **portable agent editor**; DES patterns are borrowed as a **verification lens**, not a product pivot.
 
 ## Bottom line
 
-We are turning the canvas from a single-shot "run the whole graph" tool into a **discrete-event simulation workbench** for agents. Each agent node is a discrete event. The user can run the chain end to end (today), step through the chain one level at a time (new), run any single node in isolation with hand-fed inputs (new), inspect every node's input and output after a run (new), and replay any single node from a saved transcript (new). The model is the same Arena / AnyLogic mental model: entities flow through the system, processes consume entities and emit outputs, every event is timestamped and inspectable.
+Agent Studio is a **visual editor for designing and testing agent chains that are portable** — what you build here exports cleanly and runs outside the studio against the same APIs / LLMs (Ollama today, OpenAI / Anthropic / agent-builder runtimes next). Editing must be easy. Export must be honest: if a node carries it, the spec either ships it or marks it as studio-only.
 
-The four items previously queued (lasso + group drag, LLM-inferred dependencies, generic agent-spec exporter, multi-agent compose) absorb cleanly into this DES framing and are sequenced below.
+To make editing trustworthy we borrow inspection patterns from discrete-event simulation: run any single node in isolation, step the chain one DAG level at a time, inspect every node's input/output after a run, replay any node from a saved transcript, and substitute mock outputs to test downstream without burning tokens. These are **verification tools for the editor**, not a simulation product.
+
+The four items previously queued (lasso + group drag, LLM-inferred dependencies, generic agent-spec exporter, multi-agent compose) sequence into this framing below. Spec export is no longer a late add-on — its **schema contract is established in Pass 14** and every later pass must respect it.
 
 ## Scope of this roadmap
 
 | Pass | Theme | Output |
 |---|---|---|
 | 13 | UI polish — selection model upgrade | Lasso + group drag on canvas |
-| 14 | DES foundation — single-node execution | "Solo run" mode + per-node input fixtures |
-| 15 | DES inspection + step mode | Run trace inspector + step-through chain |
-| 16 | DES intelligence — auto-ordering | LLM-inferred dependencies when graph is sparse |
-| 17 | Spec export | Write `agent.yaml` + `tools.json` + `system-prompt.md` to working folder |
-| 18 | Multi-agent compose | One project can call another as a sub-agent |
+| 14 | Single-node solo run + portable spec contract | "Solo run" mode + per-node fixtures + frozen export schema + round-trip harness |
+| 14.5 | Save snapshots + completion flag + single-file markdown export | Named project snapshots, "completed" status, round-trip-safe `agent.md` |
+| 15 | Run inspector + step-through + per-node mocks | Inspector panel, level-by-level step mode, mock outputs |
+| 16 | Inferred edge ordering for sparse graphs | LLM-inferred dependencies; accepted edges write back to spec |
+| 17 | Spec export UI | Export / import `agent.yaml` + `tools.json` + `system-prompt.md` (schema already exists from Pass 14) |
+| 18 | Multi-agent compose | One project can call another as a sub-agent; subagent reference is exportable |
 
-Each pass is independent enough to launch as a separate `/build-loop:build-loop` invocation. They share state through the existing project model and DAG runtime.
+Each pass is independent enough to launch as a separate `/build-loop:build-loop` invocation. They share state through the existing project model, DAG runtime, **and the portable spec schema established in Pass 14**.
+
+## Portability contract — the rule every pass follows
+
+Every node-level field added by a pass falls into exactly one bucket. The pass's acceptance criteria must name which.
+
+| Bucket | Where it lives | Where it goes on export | Examples |
+|---|---|---|---|
+| **Portable** | Project file + spec | `agent.yaml`, `tools.json`, `system-prompt.md`, `manifest.json` | role, instructions, inputs/outputs declarations, tool bindings, accepted edges |
+| **Replayable** | Project file + spec/evals | `evals/golden-tasks.json`, `evals/transcripts/` | run history, transcripts, golden inputs+outputs |
+| **Studio-only** | Project file, never spec | (excluded; stripped on export with a one-line note) | `runCache`, `mockOutput`, `fixture`, inferred-but-not-accepted ghost edges |
+
+**Round-trip test** (added Pass 14, runs in CI from Pass 14 onward): export → wipe studio state → import → run against the same model → output matches the pre-export run. Any pass that breaks round-trip is not done.
 
 ---
 
@@ -49,41 +64,147 @@ User-paused at start of session. Quick win before the heavier DES work. Improves
 
 ---
 
-## Pass 14 — DES foundation — single-node execution
+## Pass 14 — Single-node solo run + portable spec contract
 
 ### Why now
 
-Foundation for the rest of the DES workbench. Without solo execution there's no meaningful "isolate one agent" capability.
+Two foundations land together: **solo execution** (verify a single node in isolation) and **the export schema** (the contract every later pass must respect). Doing them together means we never invent node features that can't be expressed in the spec, and we never invent a spec that can't represent what's on the canvas.
 
 ### Design
 
-Three new concepts:
+**1. Per-node input fixture (portable).** Each node gets an optional `fixture: { inputs: any, source: "manual" | "upstream-cache" }`. Saved on the node, persisted with the project. Fixture *inputs* export to `evals/golden-tasks.json` because they describe expected I/O. The `source` field is studio-only.
 
-**1. Per-node input fixture.** Each node gets an optional `fixture: { inputs: any, source: "manual" | "upstream-cache" }`. Saved on the node, persisted with the project.
+**2. Solo run (UI only).** Right-click a node or use the "Run solo" button in the side panel. Opens a modal:
+- Inputs pre-fill from upstream `runCache` when present (editable). No separate "pull" button — the common case shouldn't need a click.
+- If the node declares `inputs[]`, render one field per input. Otherwise a single JSON textarea seeded from the last fixture or empty.
+- "Run" executes only this node, streams the response, writes to `projects[i].canvas.runCache[nodeId] = { input, output, ts }`.
 
-**2. Solo run.** Right-click a node or use a "Run solo" button in the side panel. Opens a small modal:
-- If the node declares `inputs[]`, render one input field per declared input.
-- If no declarations, render a single JSON textarea pre-populated with the node's last `fixture.inputs` if any, else empty.
-- "Pull from upstream cache" button: if the node's upstream nodes have run before in this session, auto-fill their last outputs as inputs.
-- "Run" button: executes only this node, streams the response, writes the output to a per-node cache (`projects[i].canvas.runCache[nodeId] = { input, output, ts }`).
+**3. Per-node run cache (studio-only).** localStorage with the project. Side-panel visible. "Clear cache" toolbar action. Never exported.
 
-**3. Per-node run cache.** Lives in localStorage with the project. Visible in the side panel. Cleared on demand via a "Clear cache" toolbar action.
+**4. Portable spec schema (the contract).** Frozen this pass — version `agent-spec/v1`. Defines:
+- `agent.yaml` — name, description, runtime, framework, autonomy, declared inputs/outputs.
+- `manifest.json` — tool registry, permissions, sandbox tier.
+- `system-prompt.md` — composed from role templates + node instructions.
+- `tools.json` — tool descriptions per node that uses them.
+- `evals/golden-tasks.json` — fixture inputs + recorded outputs.
+- Studio-only fields (`runCache`, `mockOutput`, ghost edges) excluded with a one-line stripped-on-export note in the schema.
+
+**5. Round-trip harness.** New `npm run test:roundtrip` script: serialize a project to spec → wipe → re-import → re-run against the same model with `OLLAMA_SEED` fixed → diff outputs. Wired into `npm run test:self`. Every later pass extends this test.
 
 ### Acceptance
 
-1. Right-click a node shows "Run solo" entry. Side panel has a "Run solo" button.
-2. Modal renders correct inputs based on declarations.
-3. "Pull from upstream cache" works when upstream nodes have cached outputs.
-4. Solo run streams output via the same SSE pattern as full runs, but only for the chosen node.
-5. Run cache persists across reload.
-6. Solo run does NOT mutate the project's canonical transcript; it writes to runCache only.
-7. Pass 1-13 regressions all pass.
+1. Right-click a node shows "Run solo". Side panel has a "Run solo" button.
+2. Modal renders correct inputs based on declarations; upstream `runCache` pre-fills editable fields.
+3. Solo run streams output via the same SSE pattern as full runs, but only for the chosen node.
+4. Run cache persists across reload; "Clear cache" empties it.
+5. Solo run does NOT mutate the project's canonical transcript; writes to `runCache` only.
+6. **Portability:** The `agent-spec/v1` schema doc exists at `docs/SPEC.md` and lists every node-level field with its bucket (portable / replayable / studio-only).
+7. **Portability:** `npm run test:roundtrip` exists, exports a sample project, re-imports, re-runs, and diff-passes for at least one fixture.
+8. Pass 1-13 regressions all pass.
+
+### Build-loop passes: **2**.
+
+---
+
+## Pass 14.5 — Save snapshots + completion flag + single-file markdown export
+
+### Why now
+
+Pass 14 froze the schema and proved exportability with the 10-file `spec/` directory. Pass 14.5 makes the editor genuinely useful for the work-in-progress lifecycle: you can save a finished design as a named snapshot, mark a project as completed (so you don't keep editing the canonical version), and ship a single `agent.md` you can paste into a chat, commit to a repo, or hand to another LLM to rebuild from scratch. Lands before Pass 15 because Pass 15's inspector reads from the same project shape — better to extend the shape once.
+
+### Design
+
+**1. Named snapshots (project-scoped, persistent).** Each project carries an optional `snapshots: [{id, name, createdAt, projectFrozen}]` array. `projectFrozen` is a deep clone of the project at snapshot time minus its own `snapshots` array (no recursion) and minus `runCache` (studio-only, per Pass 14 buckets).
+- Toolbar action: **"Save snapshot"** prompts for a name, captures current state, prepends to `snapshots[]`.
+- Side-panel section under the project: list of snapshots with name + relative time + `restore` / `delete`.
+- `restore` overwrites the live canvas + project metadata with the snapshot's frozen state; the previous live state is auto-snapshotted as `Auto-saved before restore <ISO>` so restore is reversible.
+- Snapshots are stored in localStorage with the project. Schema bump v5→v6 adds the field with `[]` default.
+
+**2. Completion flag.** Each project gets `status: "draft" | "completed" = "draft"`.
+- Toolbar action: **"Mark completed"** flips the flag and locks the canvas (read-only — no node drags, no instruction edits, no port connections, no Run/Run-solo). A muted banner across the top reads *"This project is marked completed. Click 'Reopen' to edit."*
+- **"Reopen"** flips status back to `"draft"`. Auto-snapshots the completed state first as `Completed <ISO>` so the completed version is recoverable.
+- Project switcher renders completed projects in a separate section, dimmed.
+- Schema bump v5→v6 adds `status: "draft"` default.
+
+**3. Single-file markdown export (`agent.md`).** Toolbar action: **"Export markdown"** writes `<workingFolder>/agent.md` with this structure:
+
+```markdown
+---
+agent_spec: agent-md/v1
+name: <project name>
+created_at: <ISO>
+exported_at: <ISO>
+status: draft|completed
+runtime: local-nextjs
+framework: custom-loop
+model_provider: ollama
+sandbox: workspace-write
+autonomy: human-in-loop
+---
+
+# <project name>
+
+## Goal
+<goal>
+
+## Context
+<context>
+
+## Outcome
+<outcome>
+
+## Role prompt overrides
+```yaml
+<rolePromptOverrides as YAML, or empty object>
+```
+
+## Graph
+
+### Nodes
+```yaml
+<canvas.nodes serialized as YAML — every portable + replayable field>
+```
+
+### Edges
+```yaml
+<canvas.edges as YAML>
+```
+
+## Per-node instructions
+### <node title> (`<node id>`)
+<instructions block, or "_none_" placeholder>
+
+## Fixtures (replayable)
+### <node id>
+```json
+<fixture.inputs>
+```
+```
+
+**4. Single-file markdown import.** Companion toolbar action: **"Import markdown"** parses `agent.md` back into a project. Uses YAML frontmatter for top-level fields, fenced code blocks for graph data, header-anchored sections for prose. New project is created (does not overwrite an existing one) and routed into.
+
+**5. Round-trip harness extension.** `npm run test:roundtrip` grows a second case: export project → write `agent.md` → re-parse → diff portable + replayable fields. Studio-only fields (`runCache`, snapshots, status) excluded by spec — round-trip asserts they are NOT present in the markdown.
+
+### Acceptance
+
+1. Toolbar **"Save snapshot"** prompts for a name and writes a snapshot under the active project. Side-panel lists snapshots with name + relative time.
+2. **"Restore snapshot"** overwrites the live canvas with the snapshot's content. The previous live state is auto-snapshotted first.
+3. **"Delete snapshot"** removes a single snapshot (with one confirm).
+4. **"Mark completed"** locks the canvas: nodes can't be dragged or edited; ports can't be dragged; Run / Run-solo are disabled. Banner shows.
+5. **"Reopen"** unlocks the canvas and auto-snapshots the completed state first.
+6. Project switcher groups draft vs completed projects.
+7. **Export markdown** writes `<workingFolder>/agent.md` matching the `agent-md/v1` schema. File parses as valid markdown + YAML frontmatter.
+8. **Import markdown** reads an `agent.md` and creates a new project that loads onto the canvas.
+9. **Portability:** Round-trip — export `agent.md`, re-import, diff portable + replayable fields → byte-equal (after stable key ordering). Studio-only fields (`runCache`, `snapshots`, `status`) MUST NOT appear in the markdown.
+10. **Portability:** Existing `spec/` round-trip from Pass 14 still passes. The new `agent.md` round-trip is additive.
+11. Schema bump v5 → v6 with chained migration; v5 stores upgrade additively (snapshots: [], status: "draft").
+12. Pass 1-14 regressions all pass — `npm run test:self` chains both round-trips.
 
 ### Build-loop passes: **1-2**.
 
 ---
 
-## Pass 15 — DES inspection + step mode
+## Pass 15 — Run inspector + step-through + per-node mocks
 
 ### Why now
 
@@ -119,13 +240,15 @@ Once solo execution exists, the user needs to see what happened during a chain r
 3. "Step run" pauses after each level; "Next level" advances; "Skip to end" runs without pausing further; "Cancel" aborts mid-step.
 4. Setting a mock output on a node bypasses Ollama for that node and the event is tagged `mocked: true` in the transcript.
 5. Mocked nodes still appear in the inspector with their mock as the parsed output.
-6. Pass 1-14 regressions all pass.
+6. **Portability:** `mockOutput` is tagged studio-only in the spec schema and stripped on export. Inspector transcripts export to `evals/transcripts/` as replayable.
+7. `npm run test:roundtrip` still passes after this pass.
+8. Pass 1-14 regressions all pass.
 
 ### Build-loop passes: **2**.
 
 ---
 
-## Pass 16 — DES intelligence — auto-ordering
+## Pass 16 — Inferred edge ordering for sparse graphs
 
 ### Why now
 
@@ -145,48 +268,54 @@ When the graph has nodes with no edges and no `inputs`/`outputs` declarations, b
 1. Graph with explicit edges runs as today, no inference call.
 2. Graph with no edges and `inputs`/`outputs` declared uses declarations, no inference call.
 3. Graph with no edges and no declarations triggers the inference call. Banner appears.
-4. "Accept" persists edges to the project.
-5. "Decline" runs in parallel, original behavior.
+4. "Accept" persists edges to the project **and to the exported spec** (accepted edges are portable).
+5. "Decline" runs in parallel, original behavior. Declined / un-accepted ghost edges are studio-only and never exported.
 6. Inference call uses Ollama with `format:json`. Falls back to parallel mode on failure.
-7. Pass 1-15 regressions all pass.
+7. **Portability:** `npm run test:roundtrip` covers a graph that had inferred-then-accepted edges; round-trip preserves them.
+8. Pass 1-15 regressions all pass.
 
 ### Build-loop passes: **1**.
 
 ---
 
-## Pass 17 — Spec export
+## Pass 17 — Spec export UI
 
 ### Why now
 
-The DES workbench produces well-defined per-node behavior. Other tools (agent-builder, build-loop, external runtimes) want to consume that behavior as portable spec files. Today the studio's project state lives only in the studio. This pass makes it portable.
+The schema and round-trip harness already exist (Pass 14). This pass adds the user-facing **Export** / **Import** actions, the human-readable `README.md` summary, and the agent-builder-compatibility validation. By landing UI last we know the schema has survived three passes of evolution (14, 15, 16) before being exposed.
 
 ### Design
 
-New toolbar action: **Export agent spec**. Writes to the project's working folder:
+New toolbar actions:
+
+**Export agent spec.** Writes atomically to `<workingFolder>/spec/`:
 
 ```
 <workingFolder>/spec/
-  agent.yaml         # name, description, runtime, framework, autonomy, inputs, outputs
-  manifest.json      # tool registry, permissions, sandbox tier
-  system-prompt.md   # composed from role templates + node instructions
-  tools.json         # tool descriptions per node that uses them
-  evals/golden-tasks.json  # turned from the project's run history
-  README.md          # summary + how to consume
+  agent.yaml         # frozen schema from Pass 14
+  manifest.json
+  system-prompt.md
+  tools.json
+  evals/golden-tasks.json
+  evals/transcripts/  # replayable transcripts
+  README.md           # summary + how to consume + which fields were stripped
 ```
 
-Format mirrors `agent-builder/lib/build-files.js` so the spec can be picked up by the agent-builder generator without changes.
+Format mirrors `agent-builder/lib/build-files.js` so the spec is picked up by agent-builder without changes. README lists every studio-only field that was excluded so the consumer knows what's not portable.
 
-A second mode: **Import agent spec** lets the studio open a spec directory and reconstruct nodes/edges from it. Cycle-test: studio export → studio import produces the same graph.
+**Import agent spec.** User picks a spec directory; canvas reconstructs nodes/edges. Studio-only fields default to empty.
 
 ### Acceptance
 
-1. "Export agent spec" writes the six files atomically to `<workingFolder>/spec/`.
+1. "Export agent spec" writes the files atomically to `<workingFolder>/spec/`.
 2. The exported `agent.yaml` validates against the agent-builder schema.
-3. "Import agent spec" lets the user pick a spec directory; the canvas loads the graph.
-4. Round-trip: export then import produces the same nodes/edges/instructions.
-5. Pass 1-16 regressions all pass.
+3. README lists stripped studio-only fields by name.
+4. "Import agent spec" loads a spec directory onto the canvas.
+5. **Portability:** UI-driven export → UI-driven import produces a graph that passes `npm run test:roundtrip`.
+6. **Portability:** A spec exported from the studio runs unmodified through `agent-builder/lib/build-files.js` and produces matching output for at least one fixture.
+7. Pass 1-16 regressions all pass.
 
-### Build-loop passes: **1-2**.
+### Build-loop passes: **1**.
 
 ---
 
@@ -215,7 +344,8 @@ Cycle prevention: a project cannot directly or indirectly call itself. Detected 
 3. Running a graph with a subagent node runs the inner project and inlines its output.
 4. The inspector panel for a subagent node opens a nested view of the inner project's transcript.
 5. Self-referential cycles are detected with a clear error message before any LLM call.
-6. Pass 1-17 regressions all pass.
+6. **Portability:** Subagent reference exports as `subagent: { ref: <projectId>, inlineSpec: <path> }` in `agent.yaml`. Decision: same-store ref by default; if the referenced project also has a spec on disk, include the relative path so external runtimes can resolve it. Round-trip test covers a parent + subagent pair.
+7. Pass 1-17 regressions all pass.
 
 ### Build-loop passes: **2**.
 
@@ -226,32 +356,23 @@ Cycle prevention: a project cannot directly or indirectly call itself. Detected 
 | Pass | Why it goes here |
 |---|---|
 | 13 — Lasso | Quick win, blocks nothing. UI polish lifts the rest. |
-| 14 — Solo run | Foundation for DES. Without it, "discrete event" isolation isn't possible. |
-| 15 — Inspect + step | DES core. Inspection makes solo + chain runs useful as debugging tools. |
-| 16 — Inferred order | Once inspection exists, the user can verify inferred edges visually. Bad time to ship inference without an inspector. |
-| 17 — Spec export | Independent of DES. Could be earlier, but waits for nodes to carry richer per-node state (mocks, fixtures) so the export captures everything. |
-| 18 — Multi-agent | Last because it depends on solid runtime, spec round-trip, and inspection (so users can drill into sub-agent runs). |
+| 14 — Solo run + spec contract | Foundation for verification AND portability. Schema lands here so every later pass extends a known contract instead of inventing one at the end. |
+| 15 — Inspect + step + mocks | Verification surface. Inspection makes solo + chain runs trustworthy. Mocks let users test downstream cheaply. All three share the inspector panel. |
+| 16 — Inferred order | Once inspection exists, the user can verify inferred edges visually before accepting them. Accepted edges write back to the portable spec. |
+| 17 — Spec export UI | Schema already exists (Pass 14). UI is built last so the schema has survived three passes of evolution. Round-trip is enforced from Pass 14 onward. |
+| 18 — Multi-agent | Last because subagent references need spec round-trip + inspector drill-down to work. |
 
 ---
 
-## Open questions for the user
+## Resolved decisions (2026-04-28)
 
-The following choices materially affect what gets built. Worth answering before launching Pass 14.
-
-**Q1. Solo-run inputs — auto-pull or always manual?**
-Default: when a node's upstream nodes have cached outputs in `runCache`, the solo modal pre-fills those as inputs but lets the user override. Alternative: always show empty fields, force the user to think about them.
-
-**Q2. Mock outputs — per-project or per-node?**
-Per-node is simpler. Per-project lets you save a "test fixture" for the whole graph and switch between fixtures. Recommend per-node for v1.
-
-**Q3. Step mode granularity — per level, or per node within a level?**
-Per level keeps DAG semantics (parallel siblings run together). Per node would require serializing within a level. Recommend per level.
-
-**Q4. Spec export format — agent-builder compatible only, or also OpenAgents / standard formats?**
-Agent-builder compat is concrete and validates today. OpenAgents standards are still drafty. Recommend agent-builder for v1, defer OpenAgents.
-
-**Q5. Subagent recursion — same store only, or remote URL?**
-Same store keeps everything local and inspectable. Remote URL means fetching another studio's project over the network. Recommend same store for v1; remote later.
+| # | Question | Decision |
+|---|---|---|
+| Q1 | Solo-run inputs auto-pull vs manual? | **Auto-pull from upstream `runCache`, fields editable.** No separate "pull" button. |
+| Q2 | Mocks per-node or per-project? | **Per-node** for v1. Per-project fixtures only if users ask. |
+| Q3 | Step granularity per level or per node? | **Per DAG level.** Preserves parallel-siblings semantics. |
+| Q4 | Spec format — agent-builder only, or also OpenAgents? | **Agent-builder only** for v1. OpenAgents too unsettled. |
+| Q5 | Subagent recursion — same store only or remote URL? | **Same store** for v1. Spec ref includes optional relative path so external runtimes can resolve. |
 
 ---
 
@@ -262,6 +383,8 @@ Same store keeps everything local and inspectable. Remote URL means fetching ano
 - **Inspector scrolling.** A 20-node graph produces 20 inspector entries. Mitigation: virtualize the per-node panel list, or lazy-render only on click.
 - **Multi-agent compose context size.** A subagent's full transcript inlined into the parent prompt can blow context. Mitigation: pass only the parsed output, not raw text. Surface a "show full transcript" link in the inspector.
 - **Backward compatibility.** Each pass extends the project model. Storage version bumps from `agent-studio:v4` upward. Migration paths must chain (v4 → v5 → v6 ...) so legacy users keep their data.
+- **Schema lock-in.** Pass 14 freezes `agent-spec/v1`. Later passes can extend additively but not break the contract. If a pass needs a breaking change, bump to `agent-spec/v2` with a migration path and round-trip coverage for both versions.
+- **External runtime drift.** "Portable" means portable to today's `agent-builder/lib/build-files.js`, today's Ollama API, today's OpenAI / Anthropic APIs. If those drift, the round-trip test fails fast — fix the export, don't paper over it.
 
 ---
 
@@ -288,4 +411,4 @@ The orchestrator reads this doc, picks the section for that pass, and follows it
 
 ---
 
-_Last updated 2026-04-28. After Pass 12, before Pass 13. Repo: https://github.com/tyroneross/agent-studio._
+_Last updated 2026-04-28 (reframed: portable editor + verification lens). After Pass 12, before Pass 13. Repo: https://github.com/tyroneross/agent-studio._

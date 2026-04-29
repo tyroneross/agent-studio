@@ -272,7 +272,23 @@ function safeJsonParse(text) {
 
 // Stream the chat response. Returns { text, parsed, bytes }.
 // onChunkBytes(bytes) is called as bytes accumulate.
+//
+// Pass 14 — deterministic re-runs. When OLLAMA_SEED is set in the env, we
+// pass `options.seed` to /api/chat and force `temperature: 0`. This is the
+// minimum knob set Ollama's docs say is needed for reproducible outputs
+// (same machine, same model build). The round-trip harness depends on this.
 async function streamChat(baseUrl, model, messages, signal, onChunkBytes) {
+  const seedEnv =
+    typeof process !== "undefined" && process.env ? process.env.OLLAMA_SEED : undefined;
+  const seed = seedEnv != null && seedEnv !== "" ? Number(seedEnv) : null;
+  const deterministic = Number.isFinite(seed);
+
+  const options = {
+    temperature: deterministic ? 0 : 0.2,
+    num_ctx: 8192,
+  };
+  if (deterministic) options.seed = seed;
+
   const res = await fetch(`${baseUrl}/api/chat`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -281,10 +297,7 @@ async function streamChat(baseUrl, model, messages, signal, onChunkBytes) {
       messages,
       stream: true,
       format: "json",
-      options: {
-        temperature: 0.2,
-        num_ctx: 8192,
-      },
+      options,
     }),
     signal,
   });

@@ -25,6 +25,11 @@ export default function ProjectSwitcher({
   const wrapRef = useRef(null);
   const active = projects.find((p) => p.id === activeProjectId) ?? projects[0] ?? null;
   const onlyOne = projects.length <= 1;
+  // Pass 14.5 — group projects by status so completed projects render in a
+  // separate dimmed section. Original ordering is preserved within each group
+  // so the user's mental model of "newest first" stays intact.
+  const drafts = projects.filter((p) => p.status !== "completed");
+  const completed = projects.filter((p) => p.status === "completed");
 
   // Close on outside click / Escape so the dropdown doesn't trap focus.
   useEffect(() => {
@@ -89,50 +94,32 @@ export default function ProjectSwitcher({
 
       {open && (
         <div className="proj-menu" role="menu" data-project-switcher-menu>
-          <div className="proj-menu-section">
-            {projects.map((p) => {
-              const isActive = p.id === activeProjectId;
-              return (
-                <div
-                  key={p.id}
-                  className={`proj-row ${isActive ? "is-active" : ""}`}
-                  data-project-row
-                  data-project-id={p.id}
-                >
-                  <button
-                    className="proj-pick"
-                    onClick={() => {
-                      onSelect(p.id);
-                      setOpen(false);
-                    }}
-                    title={isActive ? "Active project" : "Switch to this project"}
-                  >
-                    <span className="proj-dot" aria-hidden>{isActive ? "●" : "○"}</span>
-                    <span className="proj-row-name">{p.name}</span>
-                  </button>
-                  <div className="proj-row-actions">
-                    <button
-                      className="proj-mini"
-                      onClick={() => handleRename(p)}
-                      title="Rename project"
-                      data-project-rename
-                    >
-                      rename
-                    </button>
-                    <button
-                      className="proj-mini proj-mini-danger"
-                      onClick={() => handleDelete(p)}
-                      disabled={onlyOne}
-                      title={onlyOne ? "Cannot delete the only project" : "Delete project"}
-                      data-project-delete
-                    >
-                      delete
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+          <ProjectGroup
+            projects={drafts}
+            activeProjectId={activeProjectId}
+            onSelect={onSelect}
+            setOpen={setOpen}
+            handleRename={handleRename}
+            handleDelete={handleDelete}
+            onlyOne={onlyOne}
+          />
+          {completed.length > 0 && (
+            <>
+              <div className="proj-group-divider" data-project-completed-divider>
+                Completed
+              </div>
+              <ProjectGroup
+                projects={completed}
+                activeProjectId={activeProjectId}
+                onSelect={onSelect}
+                setOpen={setOpen}
+                handleRename={handleRename}
+                handleDelete={handleDelete}
+                onlyOne={onlyOne}
+                dimmed
+              />
+            </>
+          )}
           <div className="proj-menu-footer">
             <button className="tool-btn proj-new" onClick={handleNew} data-project-new>
               + new project
@@ -247,6 +234,165 @@ export default function ProjectSwitcher({
         }
         .proj-new {
           width: 100%;
+        }
+        .proj-group-divider {
+          padding: 6px 12px;
+          font-size: 10px;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--muted);
+          background: var(--surface-muted, #f4f3ee);
+          border-top: 1px solid var(--border);
+          border-bottom: 1px solid var(--border);
+        }
+        .proj-menu-section.is-dimmed :global(.proj-row-name) {
+          color: var(--muted);
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// Pass 14.5 — render a single group of projects (drafts or completed). The
+// dimmed flag toggles muted styling so completed projects feel secondary.
+function ProjectGroup({
+  projects,
+  activeProjectId,
+  onSelect,
+  setOpen,
+  handleRename,
+  handleDelete,
+  onlyOne,
+  dimmed = false,
+}) {
+  if (!projects || projects.length === 0) return null;
+  return (
+    <div
+      className={`proj-menu-section ${dimmed ? "is-dimmed" : ""}`}
+      data-project-group={dimmed ? "completed" : "draft"}
+    >
+      {projects.map((p) => {
+        const isActive = p.id === activeProjectId;
+        return (
+          <div
+            key={p.id}
+            className={`proj-row ${isActive ? "is-active" : ""}`}
+            data-project-row
+            data-project-id={p.id}
+            data-project-status={p.status === "completed" ? "completed" : "draft"}
+          >
+            <button
+              className="proj-pick"
+              onClick={() => {
+                onSelect(p.id);
+                setOpen(false);
+              }}
+              title={isActive ? "Active project" : "Switch to this project"}
+            >
+              <span className="proj-dot" aria-hidden>{isActive ? "●" : "○"}</span>
+              <span className="proj-row-name">{p.name}</span>
+            </button>
+            <div className="proj-row-actions">
+              <button
+                className="proj-mini"
+                onClick={() => handleRename(p)}
+                title="Rename project"
+                data-project-rename
+              >
+                rename
+              </button>
+              <button
+                className="proj-mini proj-mini-danger"
+                onClick={() => handleDelete(p)}
+                disabled={onlyOne}
+                title={onlyOne ? "Cannot delete the only project" : "Delete project"}
+                data-project-delete
+              >
+                delete
+              </button>
+            </div>
+          </div>
+        );
+      })}
+      <style jsx>{`
+        .proj-menu-section {
+          max-height: 280px;
+          overflow-y: auto;
+          padding: 6px;
+        }
+        .proj-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+          padding: 4px 6px;
+          border-radius: 6px;
+        }
+        .proj-row:hover {
+          background: var(--accent-soft);
+        }
+        .proj-row.is-active .proj-row-name {
+          color: var(--accent-strong);
+          font-weight: 600;
+        }
+        .proj-pick {
+          flex: 1;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: none;
+          border: 0;
+          padding: 4px 4px;
+          font-size: 13px;
+          color: var(--ink);
+          cursor: pointer;
+          text-align: left;
+          font-family: inherit;
+        }
+        .proj-dot {
+          width: 12px;
+          font-size: 10px;
+          color: var(--accent);
+        }
+        .proj-row-name {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .is-dimmed .proj-row-name,
+        .is-dimmed .proj-pick {
+          color: var(--muted);
+        }
+        .is-dimmed .proj-row {
+          opacity: 0.85;
+        }
+        .proj-row-actions {
+          display: flex;
+          gap: 4px;
+          flex-shrink: 0;
+        }
+        .proj-mini {
+          height: 24px;
+          padding: 0 8px;
+          border-radius: 6px;
+          border: 1px solid var(--border);
+          background: var(--surface);
+          font-size: 11px;
+          color: var(--muted);
+          cursor: pointer;
+          font-family: inherit;
+        }
+        .proj-mini:hover:not(:disabled) {
+          border-color: var(--accent);
+          color: var(--accent-strong);
+        }
+        .proj-mini-danger:hover:not(:disabled) {
+          border-color: var(--danger);
+          color: var(--danger);
+        }
+        .proj-mini:disabled {
+          color: var(--faint);
+          cursor: not-allowed;
         }
       `}</style>
     </div>

@@ -7,7 +7,8 @@
     "dev": "next dev --webpack -p 3030",
     "build": "next build",
     "start": "next start -p 3030",
-    "test:self": "node scripts/test-self.mjs"
+    "test:self": "node scripts/test-self.mjs && node scripts/test-roundtrip.mjs",
+    "test:roundtrip": "node scripts/test-roundtrip.mjs"
   },
   "dependencies": {
     "next": "^16.2.4",

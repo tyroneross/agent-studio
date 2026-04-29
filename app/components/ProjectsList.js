@@ -49,8 +49,51 @@ export default function ProjectsList({
     );
   }
 
+  // Pass 14.5 — split by status so completed projects render in a separate
+  // dimmed section under a "Completed" divider.
+  const drafts = projects.filter((p) => p.status !== "completed");
+  const completed = projects.filter((p) => p.status === "completed");
+
   return (
-    <ul className="pl-list" data-projects-list>
+    <div data-projects-list-wrap>
+      <ProjectListUL
+        projects={drafts}
+        activeProjectId={activeProjectId}
+        onOpen={onOpen}
+        handleRename={handleRename}
+        handleDelete={handleDelete}
+      />
+      {completed.length > 0 && (
+        <>
+          <div className="pl-completed-divider" data-projects-completed-divider>
+            Completed
+          </div>
+          <ProjectListUL
+            projects={completed}
+            activeProjectId={activeProjectId}
+            onOpen={onOpen}
+            handleRename={handleRename}
+            handleDelete={handleDelete}
+            dimmed
+          />
+        </>
+      )}
+      <style jsx>{`
+        .pl-completed-divider {
+          margin: 16px 0 8px;
+          font-size: 11px;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: var(--muted);
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function ProjectListUL({ projects, activeProjectId, onOpen, handleRename, handleDelete, dimmed = false }) {
+  return (
+    <ul className={`pl-list ${dimmed ? "is-dimmed" : ""}`} data-projects-list data-projects-group={dimmed ? "completed" : "draft"}>
       {projects.map((p) => {
         const isActive = p.id === activeProjectId;
         const created = formatDate(p.createdAt);
@@ -60,6 +103,7 @@ export default function ProjectsList({
             className={`pl-row ${isActive ? "is-active" : ""}`}
             data-project-row
             data-project-id={p.id}
+            data-project-status={p.status === "completed" ? "completed" : "draft"}
           >
             <div className="pl-row-main">
               <button
@@ -137,6 +181,12 @@ export default function ProjectsList({
         .pl-row.is-active {
           border-color: var(--accent);
           background: var(--accent-soft);
+        }
+        .is-dimmed .pl-row {
+          opacity: 0.7;
+        }
+        .is-dimmed .pl-name {
+          color: var(--muted);
         }
         .pl-row-main {
           display: flex;

@@ -34,7 +34,7 @@ function statusColor(status) {
   return "var(--faint)";
 }
 
-export default function TestPanel({ project, isOpen, onToggle }) {
+export default function TestPanel({ project, isOpen, onToggle, locked = false }) {
   const [models, setModels] = useState([]);
   const [modelsError, setModelsError] = useState(null);
   const [selectedModel, setSelectedModel] = useState("");
@@ -382,7 +382,8 @@ export default function TestPanel({ project, isOpen, onToggle }) {
                   type="button"
                   className="tool-btn tp-run"
                   onClick={startRun}
-                  disabled={!project || models.length === 0}
+                  disabled={!project || models.length === 0 || locked}
+                  title={locked ? "Project is completed (read-only)" : undefined}
                   data-test-panel-run
                 >
                   Run

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ProjectSwitcher from "../components/ProjectSwitcher";
+import SoloRunModal from "../components/SoloRunModal";
 import TestPanel from "../components/TestPanel";
 import WelcomeModal from "../components/WelcomeModal";
 import WorkingFolderInput from "../components/WorkingFolderInput";
@@ -17,8 +18,19 @@ import {
   getActiveProject,
   withProjectUpdated,
   withCanvasUpdated,
+  withRunCacheEntry,
+  withRunCacheCleared,
+  withSnapshotAdded,
+  withSnapshotRestored,
+  withSnapshotDeleted,
+  withStatusChanged,
+  isProjectLocked,
 } from "../lib/projects";
 import { templateFor } from "../lib/role-templates.mjs";
+import {
+  exportProjectToMarkdown,
+  importMarkdownToProject,
+} from "../lib/markdown-export.mjs";
 
 const ROLE_COLORS = {
   agent: { soft: "var(--accent-soft)", border: "var(--accent)" },
@@ -67,6 +79,10 @@ export default function StudioCanvas() {
   // once when the localStorage flag is missing. The `?` button in the toolbar
   // re-opens it without writing the flag.
   const [welcomeOpen, setWelcomeOpen] = useState(false);
+  // Pass 14 — solo-run modal + right-click context menu state. The modal is
+  // node-bound; closing it clears the binding.
+  const [soloRunNodeId, setSoloRunNodeId] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null); // { x, y, nodeId } | null
 
   const containerRef = useRef(null);
   const dragState = useRef(null);
@@ -115,6 +131,7 @@ export default function StudioCanvas() {
     if (e.button !== 0) return;
     e.stopPropagation();
     if (side !== "out") return;
+    if (locked) return; // Pass 14.5 — no port drags on completed projects.
     const startCanvas = {
       x: node.x + node.w,
       y: node.y + node.h / 2,
@@ -140,6 +157,12 @@ export default function StudioCanvas() {
   function onNodePointerDown(e, node) {
     if (e.button !== 0) return;
     e.stopPropagation();
+    // Pass 14.5 — when locked, allow selecting (read-only side panel) but no
+    // drag tracking. We still record the pointer down so a click selects.
+    if (locked) {
+      setSelectedId(node.id);
+      return;
+    }
     dragState.current = {
       type: "node",
       nodeId: node.id,
@@ -526,6 +549,323 @@ export default function StudioCanvas() {
     });
   }
 
+  // Pass 14 — solo-run cache update. Pure state write through projects.js
+  // helpers so localStorage stays the only persistence layer (per the
+  // roadmap constraint). Called by SoloRunModal's onComplete.
+  const handleSoloRunComplete = useCallback((nodeId, entry) => {
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(prev, prev.activeProjectId, (p) =>
+        withRunCacheEntry(p, nodeId, entry),
+      );
+      writeStore(next);
+      return next;
+    });
+  }, []);
+
+  // Pass 14 — wipe the active project's runCache. Toolbar action; confirms
+  // before wiping because the user can't undo this from the editor today.
+  function clearRunCache() {
+    if (!store) return;
+    if (
+      typeof window !== "undefined" &&
+      !window.confirm("Clear all cached solo-run outputs for this project?")
+    ) {
+      return;
+    }
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(prev, prev.activeProjectId, (p) =>
+        withRunCacheCleared(p),
+      );
+      writeStore(next);
+      return next;
+    });
+  }
+
+  // Hoisted so the snapshot/markdown handlers below can reference these
+  // bindings during Next.js prerender without TDZ errors. They were
+  // previously declared near the bottom of the component; minified bundles
+  // were tripping on lexical reordering.
+  const activeProject = useMemo(() => (store ? getActiveProject(store) : null), [store]);
+  // Pass 14.5 — completion lock. The data layer also enforces this via
+  // withProjectUpdated; the UI uses this flag to disable controls so the
+  // intent is visible. Snapshots and status flips remain available.
+  const locked = isProjectLocked(activeProject);
+
+  // The TestPanel needs the canvas state the user is currently looking at,
+  // not the last persisted snapshot. Compose a "live" project that overrides
+  // canvas with current in-memory nodes/edges. This lets a user run the graph
+  // immediately after editing without waiting for the debounced auto-save.
+  const liveProject = useMemo(() => {
+    if (!activeProject) return null;
+    return {
+      ...activeProject,
+      canvas: {
+        ...activeProject.canvas,
+        nodes,
+        edges,
+      },
+    };
+  }, [activeProject, nodes, edges]);
+
+  // Pass 14 — open the solo-run modal for a node. Centralised so the
+  // side-panel button and the context menu both go through one path.
+  const openSoloRun = useCallback((nodeId) => {
+    setContextMenu(null);
+    if (locked) return; // Pass 14.5 — solo-run disabled on completed projects.
+    setSoloRunNodeId(nodeId);
+  }, [locked]);
+
+  // Pass 14.5 — Save snapshot. Prompts for a name and prepends a snapshot to
+  // the active project. We flush the live canvas state into the project
+  // first (the debounced auto-save may not have fired yet) so the snapshot
+  // captures what the user sees, not the last persisted version.
+  function saveSnapshot() {
+    if (!store) return;
+    if (typeof window === "undefined") return;
+    const defaultName = `Snapshot ${new Date().toLocaleString()}`;
+    const name = window.prompt("Name this snapshot:", defaultName);
+    if (name === null) return; // user cancelled
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    setStore((prev) => {
+      if (!prev) return prev;
+      // Flush the live canvas first (allowed even when locked is false).
+      const flushed = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+      // withSnapshotAdded is allowed on completed projects too.
+      const next = withProjectUpdated(
+        flushed,
+        flushed.activeProjectId,
+        (p) => withSnapshotAdded(p, trimmed),
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      return next;
+    });
+  }
+
+  // Pass 14.5 — Restore a snapshot. Auto-snapshots first via withSnapshotRestored.
+  function restoreSnapshot(snapshotId) {
+    if (!store) return;
+    if (typeof window === "undefined") return;
+    if (!window.confirm("Restore this snapshot? Your current canvas will be auto-saved as a snapshot first.")) return;
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    setStore((prev) => {
+      if (!prev) return prev;
+      // Flush live state into the project so the auto-snapshot inside
+      // withSnapshotRestored captures the actual canvas the user sees.
+      const flushed = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+      const next = withProjectUpdated(
+        flushed,
+        flushed.activeProjectId,
+        (p) => withSnapshotRestored(p, snapshotId),
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      // Push the restored canvas into the live state.
+      const restored = next.projects.find((p) => p.id === next.activeProjectId);
+      if (restored) {
+        skipNextMirrorRef.current = true;
+        queueMicrotask(() => {
+          setNodes(restored.canvas.nodes);
+          setEdges(restored.canvas.edges);
+          setPan(restored.canvas.pan ?? { x: 0, y: 0 });
+          setZoom(restored.canvas.zoom ?? 1);
+          setSelectedId(null);
+          setSelectedEdgeId(null);
+          setExpandedId(null);
+        });
+      }
+      return next;
+    });
+  }
+
+  function deleteSnapshot(snapshotId) {
+    if (!store) return;
+    if (typeof window === "undefined") return;
+    if (!window.confirm("Delete this snapshot? This cannot be undone.")) return;
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(
+        prev,
+        prev.activeProjectId,
+        (p) => withSnapshotDeleted(p, snapshotId),
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      return next;
+    });
+  }
+
+  // Pass 14.5 — Mark completed / Reopen. Mark-completed flushes the canvas
+  // into the project first. Reopen auto-snapshots the completed state as
+  // `Completed <ISO>` first so the completed version is recoverable.
+  function markCompleted() {
+    if (!store) return;
+    if (persistTimerRef.current) {
+      clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    setStore((prev) => {
+      if (!prev) return prev;
+      const flushed = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+      const next = withProjectUpdated(
+        flushed,
+        flushed.activeProjectId,
+        (p) => withStatusChanged(p, "completed"),
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      return next;
+    });
+  }
+
+  function reopenProject() {
+    if (!store) return;
+    setStore((prev) => {
+      if (!prev) return prev;
+      const next = withProjectUpdated(
+        prev,
+        prev.activeProjectId,
+        (p) => {
+          const snapped = withSnapshotAdded(p, `Completed ${new Date().toISOString()}`);
+          return withStatusChanged(snapped, "draft");
+        },
+        { allowOnLocked: true },
+      );
+      writeStore(next);
+      return next;
+    });
+  }
+
+  // Pass 14.5 — Export markdown. Serializes the live project (so the user's
+  // unflushed edits are included), POSTs to the write-markdown route. The
+  // active project must have a workingFolder configured because the write
+  // route needs an absolute path under the allowlist; we guard against the
+  // empty case with a clear message.
+  async function exportMarkdown() {
+    if (!liveProject) return;
+    if (!liveProject.workingFolder || !liveProject.workingFolder.startsWith("/")) {
+      if (typeof window !== "undefined") {
+        window.alert("Set the project's working folder before exporting markdown.");
+      }
+      return;
+    }
+    const md = exportProjectToMarkdown(liveProject);
+    try {
+      const res = await fetch("/api/fs/write-markdown", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workingFolder: liveProject.workingFolder, content: md }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        if (typeof window !== "undefined") {
+          window.alert(`Export failed: ${json.error || res.status}`);
+        }
+        return;
+      }
+      if (typeof window !== "undefined") {
+        window.alert(`Wrote ${json.bytes} bytes to ${json.savedPath}`);
+      }
+    } catch (err) {
+      if (typeof window !== "undefined") {
+        window.alert(`Export failed: ${err?.message || "network error"}`);
+      }
+    }
+  }
+
+  // Pass 14.5 — Import markdown. Opens a file picker, parses the file as
+  // agent-md/v1, creates a NEW project (does not overwrite anything), and
+  // routes into it.
+  function importMarkdown() {
+    if (typeof document === "undefined") return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".md,text/markdown";
+    input.onchange = async () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      let text;
+      try {
+        text = await file.text();
+      } catch (err) {
+        if (typeof window !== "undefined") window.alert(`Read failed: ${err?.message || "io"}`);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = importMarkdownToProject(text);
+      } catch (err) {
+        if (typeof window !== "undefined") window.alert(`Import failed: ${err?.message || "parse"}`);
+        return;
+      }
+      // Append as a new project and switch to it.
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      setStore((prev) => {
+        if (!prev) return prev;
+        const flushed = withCanvasUpdated(prev, prev.activeProjectId, { nodes, edges, pan, zoom });
+        const next = {
+          ...flushed,
+          projects: [...flushed.projects, parsed],
+          activeProjectId: parsed.id,
+        };
+        writeStore(next);
+        skipNextMirrorRef.current = true;
+        queueMicrotask(() => {
+          setNodes(parsed.canvas.nodes);
+          setEdges(parsed.canvas.edges);
+          setPan(parsed.canvas.pan);
+          setZoom(parsed.canvas.zoom);
+          setSelectedId(null);
+          setSelectedEdgeId(null);
+          setExpandedId(null);
+        });
+        return next;
+      });
+    };
+    input.click();
+  }
+
+  // Pass 14 — right-click on a node opens a small context menu with "Run
+  // solo" as the only entry today. Pass 15 will add Set Mock + Inspect.
+  const onNodeContextMenu = useCallback((e, node) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedId(node.id);
+    setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id });
+  }, []);
+
+  // Close context menu on outside click / scroll / Esc.
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("blur", close);
+    function onKey(e) {
+      if (e.key === "Escape") close();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
+
   // Pass 7: edit a per-project role prompt override. Debounced 350ms so the
   // textarea stays responsive. Empty/whitespace-only values are treated as
   // "remove the override" (the runtime falls back to the default).
@@ -631,23 +971,10 @@ export default function StudioCanvas() {
     [nodes, selectedId],
   );
 
-  const activeProject = useMemo(() => (store ? getActiveProject(store) : null), [store]);
-
-  // The TestPanel needs the canvas state the user is currently looking at,
-  // not the last persisted snapshot. Compose a "live" project that overrides
-  // canvas with current in-memory nodes/edges. This lets a user run the graph
-  // immediately after editing without waiting for the debounced auto-save.
-  const liveProject = useMemo(() => {
-    if (!activeProject) return null;
-    return {
-      ...activeProject,
-      canvas: {
-        ...activeProject.canvas,
-        nodes,
-        edges,
-      },
-    };
-  }, [activeProject, nodes, edges]);
+  // (activeProject / locked / liveProject hoisted above the snapshot/markdown
+  // handlers — see top of the component body. The previous declaration here
+  // was removed so the handlers can reference these values without TDZ
+  // errors during Next.js prerender.)
 
   const ghostPath = useMemo(() => {
     if (!connect) return null;
@@ -689,14 +1016,19 @@ export default function StudioCanvas() {
             onDelete={handleDeleteProject}
           />
           <span className="tool-sep" />
-          <button className="tool-btn" onClick={addNode} title="Add node">
+          <button
+            className="tool-btn"
+            onClick={addNode}
+            disabled={locked}
+            title={locked ? "Project is completed (read-only)" : "Add node"}
+          >
             + node
           </button>
           <button
             className="tool-btn"
             onClick={deleteSelected}
-            disabled={!selectedId && !selectedEdgeId}
-            title="Delete selected"
+            disabled={locked || (!selectedId && !selectedEdgeId)}
+            title={locked ? "Project is completed (read-only)" : "Delete selected"}
           >
             delete
           </button>
@@ -718,9 +1050,65 @@ export default function StudioCanvas() {
           <button
             className="tool-btn"
             onClick={clearAll}
-            title="Clear this project's canvas and reset to seed graph"
+            disabled={locked}
+            title={locked ? "Project is completed (read-only)" : "Clear this project's canvas and reset to seed graph"}
           >
             clear
+          </button>
+          <button
+            className="tool-btn"
+            onClick={clearRunCache}
+            disabled={locked}
+            title={locked ? "Project is completed (read-only)" : "Clear all cached solo-run outputs for this project"}
+            data-canvas-clear-cache
+          >
+            clear cache
+          </button>
+          <span className="tool-sep" />
+          {/* Pass 14.5 — snapshot + completion + markdown actions. */}
+          <button
+            className="tool-btn"
+            onClick={saveSnapshot}
+            title="Save the current canvas as a named snapshot"
+            data-canvas-save-snapshot
+          >
+            save snapshot
+          </button>
+          {locked ? (
+            <button
+              className="tool-btn"
+              onClick={reopenProject}
+              title="Reopen this project for editing (auto-snapshots the completed state first)"
+              data-canvas-reopen
+            >
+              reopen
+            </button>
+          ) : (
+            <button
+              className="tool-btn"
+              onClick={markCompleted}
+              title="Mark project completed and lock the canvas"
+              data-canvas-mark-completed
+            >
+              mark completed
+            </button>
+          )}
+          <span className="tool-sep" />
+          <button
+            className="tool-btn"
+            onClick={exportMarkdown}
+            title="Write a single-file agent.md to the project's working folder"
+            data-canvas-export-md
+          >
+            export markdown
+          </button>
+          <button
+            className="tool-btn"
+            onClick={importMarkdown}
+            title="Import an agent.md as a new project"
+            data-canvas-import-md
+          >
+            import markdown
           </button>
           <span className="tool-sep" />
           <button
@@ -745,6 +1133,11 @@ export default function StudioCanvas() {
         </div>
       </header>
 
+      {locked && (
+        <div className="studio-locked-banner" role="status" data-canvas-locked-banner>
+          This project is marked completed. Click &quot;Reopen&quot; to edit.
+        </div>
+      )}
       <div className="studio-body">
       <div
         ref={containerRef}
@@ -854,6 +1247,7 @@ export default function StudioCanvas() {
                 onPointerDown={(e) => onNodePointerDown(e, n)}
                 onPointerEnter={() => setHoveredNodeId(n.id)}
                 onPointerLeave={() => setHoveredNodeId((id) => (id === n.id ? null : id))}
+                onContextMenu={(e) => onNodeContextMenu(e, n)}
               >
                 <div className="studio-node-role" style={{ color: c.border }}>
                   {n.role.toUpperCase()}
@@ -897,6 +1291,7 @@ export default function StudioCanvas() {
           project={liveProject}
           isOpen={testPanelOpen}
           onToggle={() => setTestPanelOpen((o) => !o)}
+          locked={locked}
         />
       </div>
 
@@ -911,6 +1306,16 @@ export default function StudioCanvas() {
             <WorkingFolderInput
               value={activeProject.workingFolder}
               onChange={handleWorkingFolderChange}
+              disabled={locked}
+            />
+
+            {/* Pass 14.5 — snapshot list. Always rendered (even when empty)
+                so the user knows the section exists; "no snapshots yet" line
+                doubles as guidance. */}
+            <SnapshotsSection
+              snapshots={activeProject.snapshots ?? []}
+              onRestore={restoreSnapshot}
+              onDelete={deleteSnapshot}
             />
 
             {selectedNode ? (
@@ -927,6 +1332,7 @@ export default function StudioCanvas() {
                     type="text"
                     value={selectedNode.title}
                     placeholder="Untitled node"
+                    disabled={locked}
                     onChange={(e) => updateNodeField(selectedNode.id, "title", e.target.value)}
                   />
                 </label>
@@ -937,6 +1343,7 @@ export default function StudioCanvas() {
                     className="panel-input panel-textarea"
                     rows={3}
                     value={selectedNode.description}
+                    disabled={locked}
                     onChange={(e) => updateNodeField(selectedNode.id, "description", e.target.value)}
                   />
                 </label>
@@ -946,6 +1353,7 @@ export default function StudioCanvas() {
                   <select
                     className="panel-input panel-select"
                     value={selectedNode.role}
+                    disabled={locked}
                     onChange={(e) => updateNodeField(selectedNode.id, "role", e.target.value)}
                   >
                     {ROLE_OPTIONS.map((r) => (
@@ -963,6 +1371,7 @@ export default function StudioCanvas() {
                     rows={8}
                     value={selectedNode.instructions ?? ""}
                     placeholder="What should this node do? (system prompt, policy, etc.)"
+                    disabled={locked}
                     onChange={(e) => updateNodeField(selectedNode.id, "instructions", e.target.value)}
                   />
                 </label>
@@ -985,9 +1394,19 @@ export default function StudioCanvas() {
           {selectedNode && (
             <div className="panel-footer">
               <button
+                className="tool-btn panel-solo-run"
+                onClick={() => openSoloRun(selectedNode.id)}
+                disabled={locked}
+                title={locked ? "Project is completed (read-only)" : "Run only this node against Ollama; result goes to this project's run cache"}
+                data-panel-solo-run
+              >
+                run solo
+              </button>
+              <button
                 className="tool-btn panel-delete"
                 onClick={deleteSelected}
-                title="Delete this node and any connected edges"
+                disabled={locked}
+                title={locked ? "Project is completed (read-only)" : "Delete this node and any connected edges"}
               >
                 delete node
               </button>
@@ -996,6 +1415,45 @@ export default function StudioCanvas() {
         </aside>
       )}
       </div>
+
+      {soloRunNodeId &&
+        liveProject &&
+        (() => {
+          const target = liveProject.canvas.nodes.find((n) => n.id === soloRunNodeId);
+          if (!target) return null;
+          return (
+            <SoloRunModal
+              project={liveProject}
+              node={target}
+              onClose={() => setSoloRunNodeId(null)}
+              onComplete={handleSoloRunComplete}
+            />
+          );
+        })()}
+
+      {contextMenu && (
+        <div
+          className="canvas-context-menu"
+          style={{
+            position: "fixed",
+            top: contextMenu.y,
+            left: contextMenu.x,
+            zIndex: 60,
+          }}
+          role="menu"
+          // Stop the global pointerdown closer from firing on our own clicks.
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="canvas-context-item"
+            onClick={() => openSoloRun(contextMenu.nodeId)}
+            data-canvas-context-run-solo
+          >
+            Run solo
+          </button>
+        </div>
+      )}
 
       <WelcomeModal open={welcomeOpen} onDismiss={dismissWelcome} />
 
@@ -1087,6 +1545,15 @@ export default function StudioCanvas() {
           display: flex;
           flex-direction: row;
           min-height: 0;
+        }
+        .studio-locked-banner {
+          padding: 8px 18px;
+          background: var(--surface-muted, #f4f3ee);
+          border-bottom: 1px solid var(--border);
+          color: var(--muted);
+          font-size: 13px;
+          text-align: center;
+          font-weight: 500;
         }
         .studio-canvas {
           position: relative;
@@ -1323,6 +1790,19 @@ export default function StudioCanvas() {
         .panel-footer {
           padding: 12px 18px 18px;
           border-top: 1px solid var(--border);
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .panel-solo-run {
+          width: 100%;
+          background: var(--accent);
+          color: #fff;
+          border-color: var(--accent);
+          font-weight: 600;
+        }
+        .panel-solo-run:hover:not(:disabled) {
+          background: var(--accent-strong);
         }
         .panel-delete {
           width: 100%;
@@ -1333,6 +1813,31 @@ export default function StudioCanvas() {
           border-color: var(--danger);
           color: var(--danger);
           background: var(--danger-soft);
+        }
+        .canvas-context-menu {
+          background: var(--surface);
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          box-shadow: var(--shadow-lift);
+          padding: 4px;
+          min-width: 140px;
+        }
+        .canvas-context-item {
+          display: block;
+          width: 100%;
+          text-align: left;
+          padding: 8px 10px;
+          border-radius: 6px;
+          background: transparent;
+          border: 0;
+          font: inherit;
+          font-size: 13px;
+          color: var(--ink);
+          cursor: pointer;
+        }
+        .canvas-context-item:hover {
+          background: var(--surface-muted);
+          color: var(--accent-strong);
         }
         .role-prompt-section {
           border: 1px solid var(--border);
@@ -1489,6 +1994,161 @@ function RolePromptSection({ role, overrides, draftValue, expanded, onToggle, on
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// Pass 14.5 — snapshot list in the side panel. Always rendered so the user
+// knows the section exists; an empty list shows a one-line guidance string.
+// Each row carries a relative time label via Intl.RelativeTimeFormat — the
+// label re-computes on every render so a snapshot saved 30 seconds ago shows
+// "30 seconds ago" without a timer.
+function formatRelative(iso) {
+  if (typeof iso !== "string") return "";
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const diffMs = t - Date.now();
+  const abs = Math.abs(diffMs);
+  let value;
+  let unit;
+  if (abs < 60_000) {
+    value = Math.round(diffMs / 1000);
+    unit = "second";
+  } else if (abs < 3_600_000) {
+    value = Math.round(diffMs / 60_000);
+    unit = "minute";
+  } else if (abs < 86_400_000) {
+    value = Math.round(diffMs / 3_600_000);
+    unit = "hour";
+  } else if (abs < 30 * 86_400_000) {
+    value = Math.round(diffMs / 86_400_000);
+    unit = "day";
+  } else if (abs < 365 * 86_400_000) {
+    value = Math.round(diffMs / (30 * 86_400_000));
+    unit = "month";
+  } else {
+    value = Math.round(diffMs / (365 * 86_400_000));
+    unit = "year";
+  }
+  try {
+    const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+    return rtf.format(value, unit);
+  } catch {
+    return iso;
+  }
+}
+
+function SnapshotsSection({ snapshots, onRestore, onDelete }) {
+  return (
+    <div className="snap-section" data-snapshots-section>
+      <span className="panel-label">Snapshots</span>
+      {(!snapshots || snapshots.length === 0) ? (
+        <p className="snap-empty">No snapshots yet. Use &quot;save snapshot&quot; in the toolbar.</p>
+      ) : (
+        <ul className="snap-list">
+          {snapshots.map((s) => (
+            <li key={s.id} className="snap-row" data-snapshot-row data-snapshot-id={s.id}>
+              <div className="snap-meta">
+                <span className="snap-name" title={s.name}>{s.name}</span>
+                <span className="snap-time" title={s.createdAt}>{formatRelative(s.createdAt)}</span>
+              </div>
+              <div className="snap-actions">
+                <button
+                  type="button"
+                  className="snap-mini"
+                  onClick={() => onRestore(s.id)}
+                  data-snapshot-restore
+                  title="Restore this snapshot (auto-saves current state first)"
+                >
+                  restore
+                </button>
+                <button
+                  type="button"
+                  className="snap-mini snap-mini-danger"
+                  onClick={() => onDelete(s.id)}
+                  data-snapshot-delete
+                  title="Delete this snapshot"
+                >
+                  delete
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      <style jsx>{`
+        .snap-section {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          margin-top: 4px;
+        }
+        .snap-empty {
+          font-size: 12px;
+          color: var(--muted);
+          margin: 0;
+        }
+        .snap-list {
+          list-style: none;
+          padding: 0;
+          margin: 0;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          max-height: 220px;
+          overflow-y: auto;
+        }
+        .snap-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+          padding: 6px 8px;
+          border: 1px solid var(--border);
+          border-radius: 6px;
+          background: var(--surface);
+        }
+        .snap-meta {
+          display: flex;
+          flex-direction: column;
+          min-width: 0;
+        }
+        .snap-name {
+          font-size: 12px;
+          color: var(--ink);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .snap-time {
+          font-size: 10px;
+          color: var(--muted);
+        }
+        .snap-actions {
+          display: flex;
+          gap: 4px;
+          flex-shrink: 0;
+        }
+        .snap-mini {
+          height: 22px;
+          padding: 0 8px;
+          border-radius: 4px;
+          border: 1px solid var(--border);
+          background: var(--surface);
+          font-size: 11px;
+          color: var(--muted);
+          cursor: pointer;
+          font-family: inherit;
+        }
+        .snap-mini:hover:not(:disabled) {
+          border-color: var(--accent);
+          color: var(--accent-strong);
+        }
+        .snap-mini-danger:hover:not(:disabled) {
+          border-color: var(--danger);
+          color: var(--danger);
+        }
+      `}</style>
     </div>
   );
 }

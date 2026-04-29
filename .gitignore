@@ -6,6 +6,8 @@ dist/
 !.env.example
 .DS_Store
 .claude/bookmarks/
+.build-loop/
+.ibr/
 
 # >>> NavGator safety guard (auto-managed)
 # These files are regenerated from .env on every NavGator scan and contain

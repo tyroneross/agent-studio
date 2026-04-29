@@ -19,7 +19,7 @@ import FolderPickerModal from "./FolderPickerModal";
 // absolute paths via drag-drop in standard mode, so the zone could only ever
 // surface a name and apologize). Drag-drop for actual file uploads stays in
 // UploadZone, which is a different surface.
-export default function WorkingFolderInput({ value, onChange }) {
+export default function WorkingFolderInput({ value, onChange, disabled = false }) {
   const [draft, setDraft] = useState(value ?? "");
   const [status, setStatus] = useState({ kind: "idle" }); // idle | checking | ok | warn | error
   const [hint, setHint] = useState("");
@@ -138,6 +138,7 @@ export default function WorkingFolderInput({ value, onChange }) {
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
+          disabled={disabled}
           data-working-folder-input
         />
         {badge}
@@ -145,6 +146,7 @@ export default function WorkingFolderInput({ value, onChange }) {
           type="button"
           className="tool-btn wf-browse"
           onClick={() => setPickerOpen(true)}
+          disabled={disabled}
           data-working-folder-browse
         >
           Browse
