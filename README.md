@@ -66,6 +66,37 @@ Uploads dropped on the new-project form land in `<workingFolder>/uploads/`. The 
 - **Working folder rejected.** Paths must start with `/Users/`, `/tmp/`, or `/var/folders/`. Pick a different folder or create one under `/tmp/`. The app calls `/api/fs/validate` to check; the response includes a reason.
 - **Demo project conflict.** Clicking *Try the demo project* a second time opens the existing one rather than duplicating. To start fresh, delete it from the project list first.
 
+## What's new in v0.2
+
+Five passes have shipped on top of the original single-shot run model. Most surface as toolbar actions on the canvas; a few are per-node capabilities you set in the right panel.
+
+### Toolbar actions
+
+- **Run solo** — run a single selected node against a one-off input without executing the rest of the graph. Useful for iterating on a prompt in isolation.
+- **Save snapshot** — capture the current graph + node configs as a named snapshot you can restore later. Snapshots live alongside the project.
+- **Mark completed** — flag a project as done. Completed projects are filed separately on the project list.
+- **Reopen** — bring a completed project back into the active list.
+- **Export markdown** — write the current graph and node configs out as a Markdown brief that's easy to read or paste into chat.
+- **Import markdown** — load a previously-exported Markdown brief and reconstruct the graph from it.
+- **Export spec** — write the project to a portable JSON spec (graph + per-node config + working-folder hint).
+- **Import spec** — load a JSON spec and instantiate it as a new project. Round-trips with Export spec.
+- **Clear cache** — drop the in-memory model list and re-fetch from Ollama. Use after pulling a new model so it shows in the dropdown without a refresh.
+- **Step run** — execute the graph one node at a time, pausing between nodes. Pairs with the inspector for debugging branches.
+- **Inspect last run** — open the inspector panel against the most recent run; shows per-node input, output, and timing without re-running.
+- **Set mock** — enable mock-data mode for the selected node. The node returns a fixture instead of calling the model. Use to test downstream branches without burning tokens.
+- **Infer order** — for sparse graphs (few or no edges), the canvas asks the model to suggest a sensible execution order based on node intent. Result is shown as edges you can accept or reject.
+
+### Node capabilities
+
+- **Per-node mocks** — each node can carry an inline mock response. When mock mode is on, the runtime serves that response instead of calling the model.
+- **Per-node fixtures** — attach a JSON or text fixture to a node so its prompt can reference real example data without having to upload anything to the working folder.
+- **`subagent` role** — a new role type alongside `agent` and `tool`. A subagent node can reference another graph (or a portable spec) and execute it as a sub-step. Cycle detection prevents a graph from referencing itself.
+
+### Storage-aware saving
+
+- **Storage pill** — a compact indicator next to the project title that shows whether the project's state lives in `localStorage`, on disk, or in both. Click it to open the storage panel.
+- **Storage panel** — full controls for promoting localStorage state to disk, importing from disk into localStorage, or clearing one tier without touching the other. Useful when migrating a project between machines.
+
 ## Architecture overview
 
 A Next.js 16 + React 19 app that stores all project state in `localStorage` (no database). The canvas page renders an SVG layer for edges and absolutely positioned divs for nodes. Test runs go through `/api/agent/run`, which runs the graph as a DAG against your local Ollama and streams Server-Sent Events for live per-node status. Artifacts get written to the project's working folder under `runs/<timestamp>/`.
