@@ -1,5 +1,12 @@
 # agent-studio
 
+> **Consolidated into agent-builder-platform.** This repo is now `apps/agent-studio`
+> inside the `agent-builder-platform` monorepo (`~/dev/git-folder/agent-builder-platform`),
+> which shares `@tyroneross/agent-spec` + `@tyroneross/local-llm` across all three apps.
+> This standalone copy remains for reference; active development happens in the monorepo.
+> A pre-migration reversibility bundle is at `archive/pre-agent-platform-*.bundle`.
+
+
 A local visual canvas for designing and testing small agent graphs against your own Ollama instance. No cloud, no waiting, no signup.
 
 ## At a glance
